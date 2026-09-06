@@ -43,6 +43,7 @@ SPOTIFY_API_PAGE_SIZE = 100
 SPOTIFY_API_MAX_RETRIES = 3
 SPOTIFY_API_RETRY_BASE_SECONDS = 2
 SPOTIFY_API_PAGE_DELAY_SECONDS = 1.0
+SPOTIFY_API_MAX_RETRY_AFTER_SECONDS = int(os.getenv("SPOTIFY_API_MAX_RETRY_AFTER_SECONDS") or 30)
 SPOTIFY_PLAYLIST_CACHE_DIRNAME = ".spotify_cache"
 
 SPOTIFY_HEADERS = {
@@ -373,6 +374,29 @@ def resolve_spotify_shortlink(url):
     response = requests.get(raw, headers=SPOTIFY_HEADERS, timeout=12, allow_redirects=True)
     response.raise_for_status()
     return response.url or raw
+
+
+def sanitize_spotify_input(value):
+    raw = clean_spotify_text(value)
+    if not raw:
+        return raw
+
+    raw = raw.strip().strip("`\"'")
+
+    markdown_link = re.match(r"^\[(?P<label>.+?)\]\((?P<target>.+?)\)$", raw)
+    if markdown_link:
+        target = clean_spotify_text(markdown_link.group("target")).strip("`\"'")
+        label = clean_spotify_text(markdown_link.group("label")).strip("`\"'")
+        for candidate in (target, label):
+            if re.search(r"https?://", candidate, flags=re.I):
+                return candidate
+        return target or label
+
+    match = re.search(r"https?://[^\s)\]]+", raw, flags=re.I)
+    if match:
+        return match.group(0).rstrip(").,;]")
+
+    return raw
 
 
 def spotify_public_url(kind, item_id):
@@ -866,6 +890,11 @@ def fetch_spotify_playlist_tracks_api(playlist_id, access_token):
                 delay = int(retry_after) if retry_after else min(60, SPOTIFY_API_RETRY_BASE_SECONDS * (attempt + 1) * 2)
             except Exception:
                 delay = min(60, SPOTIFY_API_RETRY_BASE_SECONDS * (attempt + 1) * 2)
+            if delay > SPOTIFY_API_MAX_RETRY_AFTER_SECONDS:
+                raise RuntimeError(
+                    f"Spotify API rate-limit trop long ({delay}s). "
+                    "Le chemin API est abandonné pour éviter une attente excessive."
+                )
             delay = max(3, delay)
             print(f"    Spotify API rate-limit : pause {delay}s")
             time.sleep(delay)
@@ -1016,6 +1045,7 @@ def fetch_spotify_playlist_html(playlist_id):
 
 
 def resolve_spotify_tracks(public_url):
+    public_url = sanitize_spotify_input(public_url)
     resolved_url = resolve_spotify_shortlink(public_url)
     kind, item_id = normalize_spotify_target(resolved_url)
     if not kind:

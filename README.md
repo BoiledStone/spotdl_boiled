@@ -32,6 +32,7 @@ Variables utiles :
 - `BOT_YTDLP_COOKIES_BROWSER` : source des cookies yt-dlp, `firefox` par défaut
 - `BOT_ENV_FILE` : chemin vers un autre fichier `.env`
 - `SPOTDL_PYTHON` : exécutable Python utilisé par le lanceur PowerShell
+- `SPOTIFY_API_MAX_RETRY_AFTER_SECONDS` : attente maximale acceptée quand Spotify répond `429`
 - `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` : optionnels
 
 ## Lancement
@@ -42,6 +43,8 @@ PowerShell :
 Set-Location .\spotdl_github
 .\download_playlist.ps1 -Playlist "https://open.spotify.com/playlist/..."
 ```
+
+Si tu copies un lien depuis un chat et qu'il arrive sous la forme `[texte](https://...)`, le script extrait automatiquement l'URL Spotify.
 
 Ou directement :
 
@@ -56,6 +59,7 @@ python .\download_missing_autonomous_v2.py --playlist "https://open.spotify.com/
 - Le cache Spotify est stocké dans `.spotify_cache`.
 - Les échecs sont écrits dans `_FAILED_BOT_RESOLVER.txt`.
 - Le script ne remplace pas un fichier audio existant.
+- Les longues limites Spotify sont plafonnées à 30 secondes par défaut.
 - Si Spotify ne renvoie qu'un aperçu partiel d'une grande playlist, le script s'arrête au lieu de télécharger seulement les 100 premiers titres.
 
 ## Notes GitHub
