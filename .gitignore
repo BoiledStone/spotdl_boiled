@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment
+.env
+
+# Downloads and cache
+downloads/
+.spotify_cache/
+_FAILED*.txt
+*.opus
+*.mp3
+*.m4a
+*.flac
+*.wav
+*.ogg
+*.aac
+*.webm
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
