@@ -33,6 +33,11 @@ Variables utiles :
 - `BOT_ENV_FILE` : chemin vers un autre fichier `.env`
 - `SPOTDL_PYTHON` : exécutable Python utilisé par le lanceur PowerShell
 - `SPOTIFY_API_MAX_RETRY_AFTER_SECONDS` : attente maximale acceptée quand Spotify répond `429`
+- `SPOTIFY_PATHFINDER_PAGE_SIZE` : taille des pages lues via l'API interne Spotify
+- `SPOTIFY_PATHFINDER_PAGE_DELAY_SECONDS` : pause entre pages Pathfinder
+- `SPOTIFY_SP_DC` : cookie `sp_dc` si tu veux l’indiquer manuellement
+- `SPOTIFY_TOTP_SECRETS_URL` : source des secrets TOTP Spotify
+- `SPOTIFY_TOTP_TIMEOUT_SECONDS` : timeout pour récupérer les secrets / l'heure serveur
 - `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` : optionnels
 
 ## Lancement
@@ -45,6 +50,8 @@ Set-Location .\spotdl_github
 ```
 
 Si tu copies un lien depuis un chat et qu'il arrive sous la forme `[texte](https://...)`, le script extrait automatiquement l'URL Spotify.
+
+Pour réutiliser un dossier déjà rempli et ne rien remplacer, passe ce dossier en `-Output`.
 
 Ou directement :
 
@@ -59,8 +66,8 @@ python .\download_missing_autonomous_v2.py --playlist "https://open.spotify.com/
 - Le cache Spotify est stocké dans `.spotify_cache`.
 - Les échecs sont écrits dans `_FAILED_BOT_RESOLVER.txt`.
 - Le script ne remplace pas un fichier audio existant.
+- Les playlists Spotify passent par l'API interne du web player et récupèrent la liste complète, pas seulement les 100 premiers titres visibles publiquement.
 - Les longues limites Spotify sont plafonnées à 30 secondes par défaut.
-- Si Spotify ne renvoie qu'un aperçu partiel d'une grande playlist, le script s'arrête au lieu de télécharger seulement les 100 premiers titres.
 
 ## Notes GitHub
 

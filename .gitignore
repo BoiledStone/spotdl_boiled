@@ -10,6 +10,7 @@ __pycache__/
 # Downloads and cache
 downloads/
 .spotify_cache/
+_tmp*
 _FAILED*.txt
 *.opus
 *.mp3
@@ -24,3 +25,4 @@ _FAILED*.txt
 .DS_Store
 Thumbs.db
 .vscode/
+.ref_spogo/

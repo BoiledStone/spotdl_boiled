@@ -1,11 +1,16 @@
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import re
 import sys
+import struct
 import time
 import unicodedata
 from contextlib import suppress
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from html import unescape
 from urllib.parse import quote, urlparse
@@ -44,7 +49,21 @@ SPOTIFY_API_MAX_RETRIES = 3
 SPOTIFY_API_RETRY_BASE_SECONDS = 2
 SPOTIFY_API_PAGE_DELAY_SECONDS = 1.0
 SPOTIFY_API_MAX_RETRY_AFTER_SECONDS = int(os.getenv("SPOTIFY_API_MAX_RETRY_AFTER_SECONDS") or 30)
+SPOTIFY_WEB_TOKEN_URL = "https://open.spotify.com/api/token"
+SPOTIFY_WEB_TOKEN_REFERER = "https://open.spotify.com/"
+SPOTIFY_SERVER_TIME_URL = "https://open.spotify.com/"
+SPOTIFY_PATHFINDER_URL = "https://api-partner.spotify.com/pathfinder/v1/query"
+SPOTIFY_TOTP_SECRETS_URL = os.getenv("SPOTIFY_TOTP_SECRETS_URL") or "https://github.com/xyloflake/spot-secrets-go/blob/main/secrets/secretDict.json?raw=true"
+SPOTIFY_TOTP_TIMEOUT_SECONDS = int(os.getenv("SPOTIFY_TOTP_TIMEOUT_SECONDS") or 10)
+SPOTIFY_PATHFINDER_PAGE_SIZE = int(os.getenv("SPOTIFY_PATHFINDER_PAGE_SIZE") or 200)
+SPOTIFY_PATHFINDER_PAGE_DELAY_SECONDS = float(os.getenv("SPOTIFY_PATHFINDER_PAGE_DELAY_SECONDS") or 0.2)
+SPOTIFY_SP_DC = os.getenv("SPOTIFY_SP_DC") or ""
 SPOTIFY_PLAYLIST_CACHE_DIRNAME = ".spotify_cache"
+SPOTIFY_TOTP_SECRET_CIPHER_DICT = {
+    59: [123, 105, 79, 70, 110, 59, 52, 125, 60, 49, 80, 70, 89, 75, 80, 86, 63, 53, 123, 37, 117, 49, 52, 93, 77, 62, 47, 86, 48, 104, 68, 72],
+    60: [79, 109, 69, 123, 90, 65, 46, 74, 94, 34, 58, 48, 70, 71, 92, 85, 122, 63, 91, 64, 87, 87],
+    61: [44, 55, 47, 42, 70, 40, 34, 114, 76, 74, 50, 111, 120, 97, 75, 76, 94, 102, 43, 69, 49, 120, 118, 80, 64, 78],
+}
 
 SPOTIFY_HEADERS = {
     "User-Agent": (
@@ -502,6 +521,320 @@ def fetch_spotify_client_credentials_token():
     return token if isinstance(token, str) and token else None
 
 
+def load_spotify_totp_secret_cipher_dict():
+    try:
+        response = requests.get(
+            SPOTIFY_TOTP_SECRETS_URL,
+            headers={**SPOTIFY_HEADERS, "Accept": "application/json"},
+            timeout=SPOTIFY_TOTP_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        payload = None
+
+    secrets = {}
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            try:
+                version = int(key)
+            except Exception:
+                continue
+            if isinstance(value, list) and value and all(isinstance(item, int) for item in value):
+                secrets[version] = [int(item) for item in value]
+
+    if secrets:
+        return secrets
+
+    return dict(SPOTIFY_TOTP_SECRET_CIPHER_DICT)
+
+
+def extract_spotify_browser_cookie(cookie_name):
+    cookie_value = SPOTIFY_SP_DC if cookie_name == "sp_dc" and SPOTIFY_SP_DC else None
+    if cookie_value:
+        return cookie_value
+
+    try:
+        cookie_jar = yt_dlp.cookies.extract_cookies_from_browser(YTDLP_COOKIES_BROWSER)
+    except Exception:
+        return None
+
+    for cookie in cookie_jar:
+        if getattr(cookie, "name", None) != cookie_name:
+            continue
+        value = getattr(cookie, "value", None)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def spotify_server_timestamp():
+    for method in ("head", "get"):
+        try:
+            response = requests.request(
+                method.upper(),
+                SPOTIFY_SERVER_TIME_URL,
+                headers=SPOTIFY_HEADERS,
+                timeout=SPOTIFY_TOTP_TIMEOUT_SECONDS,
+                allow_redirects=True,
+            )
+            date_header = response.headers.get("Date")
+            if not date_header:
+                continue
+            server_time = parsedate_to_datetime(date_header)
+            if server_time.tzinfo is None:
+                server_time = server_time.replace(tzinfo=timezone.utc)
+            return int(server_time.timestamp())
+        except Exception:
+            continue
+    raise RuntimeError("Impossible de lire l'heure serveur Spotify.")
+
+
+def spotify_hotp(secret_key, counter, *, digits=6):
+    digest = hmac.new(secret_key, struct.pack(">Q", int(counter)), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    code = struct.unpack(">I", digest[offset : offset + 4])[0] & 0x7FFFFFFF
+    return f"{code % (10 ** digits):0{digits}d}"
+
+
+def spotify_totp_from_cipher(cipher_bytes, server_timestamp, *, interval=30, digits=6):
+    cipher_bytes = bytes(cipher_bytes)
+    transformed = "".join(str(byte ^ ((index % 33) + 9)) for index, byte in enumerate(cipher_bytes))
+    secret_key = transformed.encode("utf-8")
+    counter = int(server_timestamp // interval)
+    return spotify_hotp(secret_key, counter, digits=digits)
+
+
+def fetch_spotify_web_access_token():
+    sp_dc = extract_spotify_browser_cookie("sp_dc")
+    if not sp_dc:
+        return None
+
+    server_timestamp = spotify_server_timestamp()
+    secret_map = load_spotify_totp_secret_cipher_dict()
+    if not secret_map:
+        return None
+
+    headers = dict(SPOTIFY_HEADERS)
+    headers.update(
+        {
+            "Accept": "application/json",
+            "Referer": SPOTIFY_WEB_TOKEN_REFERER,
+            "App-Platform": "WebPlayer",
+            "Origin": SPOTIFY_WEB_TOKEN_REFERER,
+            "Cookie": f"sp_dc={sp_dc}",
+        }
+    )
+
+    for version in sorted(secret_map, reverse=True):
+        cipher_bytes = secret_map.get(version)
+        if not cipher_bytes:
+            continue
+
+        totp = spotify_totp_from_cipher(cipher_bytes, server_timestamp)
+        try:
+            response = requests.get(
+                SPOTIFY_WEB_TOKEN_URL,
+                headers=headers,
+                params={
+                    "reason": "transport",
+                    "productType": "web-player",
+                    "totp": totp,
+                    "totpServer": server_timestamp,
+                    "totpVer": version,
+                },
+                timeout=20,
+            )
+        except Exception:
+            continue
+
+        if response.status_code == 200:
+            payload = response.json()
+            token = payload.get("accessToken") or payload.get("access_token")
+            if isinstance(token, str) and token:
+                return token
+            continue
+
+        if response.status_code in {400, 401}:
+            continue
+
+        raise RuntimeError(
+            f"Spotify web-token HTTP {response.status_code} : "
+            f"{clean_spotify_text(response.text)[:160] or 'réponse invalide'}"
+        )
+
+    return None
+
+
+def spotify_graphql_hash_cache_path():
+    return OUTPUT_DIR / SPOTIFY_PLAYLIST_CACHE_DIRNAME / "graphql_hashes.json"
+
+
+def load_spotify_graphql_hash_cache():
+    cache_path = spotify_graphql_hash_cache_path()
+    if not cache_path.exists():
+        return {}
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_spotify_graphql_hash_cache(cache):
+    try:
+        cache_path = spotify_graphql_hash_cache_path()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def invalidate_spotify_graphql_hash_cache(operation):
+    cache = load_spotify_graphql_hash_cache()
+    if operation in cache:
+        cache.pop(operation, None)
+        save_spotify_graphql_hash_cache(cache)
+
+
+def pick_spotify_web_player_bundle(html_text):
+    if not html_text:
+        return None
+    for match in re.finditer(r'<script[^>]+src=["\']([^"\']+\.js)["\']', html_text, flags=re.I):
+        src = match.group(1)
+        if "/web-player/" not in src and "/mobile-web-player/" not in src:
+            continue
+        if src.startswith("//"):
+            return f"https:{src}"
+        if src.startswith("/"):
+            return f"https://open.spotify.com{src}"
+        return src
+    return None
+
+
+def extract_spotify_graphql_operation_hash(js_text, operation):
+    if not js_text or not operation:
+        return None
+
+    escaped = re.escape(operation)
+    patterns = [
+        rf"{escaped}.{{0,500}}?sha256Hash\\?\":\\?\"([a-f0-9]{{64}})\\?\"",
+        rf'"{escaped}","(?:query|mutation)","([a-f0-9]{{64}})"',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, js_text, flags=re.S)
+        if match:
+            return match.group(1)
+    return None
+
+
+def fetch_spotify_graphql_operation_hash(operation):
+    cache = load_spotify_graphql_hash_cache()
+    cached = cache.get(operation)
+    if isinstance(cached, str) and re.fullmatch(r"[a-f0-9]{64}", cached):
+        return cached
+
+    html_text = fetch_text("https://open.spotify.com/", timeout=25)
+    bundle_url = pick_spotify_web_player_bundle(html_text)
+    if not bundle_url:
+        raise RuntimeError("bundle web-player Spotify introuvable.")
+
+    js_text = fetch_text(bundle_url, timeout=30)
+    operation_hash = extract_spotify_graphql_operation_hash(js_text, operation)
+    if not operation_hash:
+        raise RuntimeError(f"hash GraphQL Spotify introuvable pour {operation}.")
+
+    cache[operation] = operation_hash
+    save_spotify_graphql_hash_cache(cache)
+    return operation_hash
+
+
+def nested_dict(value, *path):
+    current = value
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current if isinstance(current, dict) else None
+
+
+def nested_number(value, *path):
+    current = value
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    if isinstance(current, bool) or current is None:
+        return None
+    if isinstance(current, (int, float)):
+        return current
+    try:
+        return float(current)
+    except Exception:
+        return None
+
+
+def spotify_id_from_uri(uri):
+    if not isinstance(uri, str):
+        return None
+    parts = uri.split(":")
+    if len(parts) >= 3:
+        return parts[-1]
+    return None
+
+
+def spotify_artist_name_from_value(value):
+    if not isinstance(value, dict):
+        return None
+
+    profile = value.get("profile")
+    if isinstance(profile, dict) and profile.get("name"):
+        return clean_spotify_text(profile.get("name"))
+
+    identity = value.get("identityTrait")
+    if isinstance(identity, dict):
+        contributors = identity.get("contributors")
+        if isinstance(contributors, dict):
+            items = contributors.get("items")
+            if isinstance(items, list):
+                names = [clean_spotify_text(item.get("name")) for item in items if isinstance(item, dict) and item.get("name")]
+                if names:
+                    return ", ".join(name for name in names if name)
+
+    for key in ("node", "artist", "data"):
+        child = value.get(key)
+        name = spotify_artist_name_from_value(child)
+        if name:
+            return name
+
+    if value.get("name"):
+        return clean_spotify_text(value.get("name"))
+    return None
+
+
+def spotify_artist_names_from_container(container):
+    names = []
+    if isinstance(container, list):
+        iterable = container
+    elif isinstance(container, dict):
+        iterable = None
+        for key in ("items", "nodes", "edges"):
+            if isinstance(container.get(key), list):
+                iterable = container.get(key)
+                break
+        if iterable is None:
+            name = spotify_artist_name_from_value(container)
+            return [name] if name else []
+    else:
+        return []
+
+    for entry in iterable:
+        name = spotify_artist_name_from_value(entry)
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
 def decode_spotify_next_data(text):
     match = re.search(r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>([\s\S]+?)</script>', text, flags=re.I)
     if not match:
@@ -755,6 +1088,13 @@ def spotify_thumbnail_from_entity(entity, fallback=None):
                 if isinstance(source, dict) and source.get("url"):
                     return source["url"]
 
+    for nested_key in ("album", "albumOfTrack"):
+        nested = entity.get(nested_key) if isinstance(entity, dict) else None
+        if isinstance(nested, dict):
+            candidate = spotify_thumbnail_from_entity(nested, fallback=None)
+            if candidate:
+                return candidate
+
     visual = entity.get("visualIdentity")
     if isinstance(visual, dict):
         images = visual.get("image")
@@ -762,6 +1102,18 @@ def spotify_thumbnail_from_entity(entity, fallback=None):
             for image in reversed(images):
                 if isinstance(image, dict) and image.get("url"):
                     return image["url"]
+
+    visual_trait = entity.get("visualIdentityTrait") if isinstance(entity, dict) else None
+    if isinstance(visual_trait, dict):
+        for key in ("squareCoverImage", "sixteenByNineCoverImage"):
+            image = visual_trait.get(key)
+            if not isinstance(image, dict):
+                continue
+            sources = image.get("sources")
+            if isinstance(sources, list):
+                for source in reversed(sources):
+                    if isinstance(source, dict) and source.get("url"):
+                        return source["url"]
 
     if isinstance(entity, dict):
         direct_url = entity.get("thumbnail") or entity.get("image")
@@ -795,15 +1147,32 @@ def artist_name_from_item(item):
     if isinstance(artists, list):
         names = []
         for a in artists:
-            if isinstance(a, dict) and a.get("name"):
-                names.append(clean_spotify_text(a.get("name")))
+            if not isinstance(a, dict):
+                continue
+            name = clean_spotify_text(a.get("name"))
+            if not name:
+                name = spotify_artist_name_from_value(a)
+            if name:
+                names.append(name)
         if names:
             return ", ".join(names)
+    if isinstance(artists, dict):
+        names = spotify_artist_names_from_container(artists)
+        if names:
+            return ", ".join(names)
+    for key in ("firstArtist", "otherArtists"):
+        names = spotify_artist_names_from_container(item.get(key))
+        if names:
+            return ", ".join(names)
+    name = spotify_artist_name_from_value(item)
+    if name:
+        return name
     return clean_spotify_text(item.get("subtitle") or item.get("artist"))
 
 
 def normalize_spotify_track(item):
-    title = clean_spotify_text(item.get("title") or item.get("name"))
+    identity = item.get("identityTrait") if isinstance(item.get("identityTrait"), dict) else {}
+    title = clean_spotify_text(item.get("title") or item.get("name") or identity.get("name"))
     artist = artist_name_from_item(item)
     duration_raw = item.get("duration")
     duration = None
@@ -816,16 +1185,37 @@ def normalize_spotify_track(item):
             duration = int(round(float(item["duration_ms"]) / 1000))
         except Exception:
             duration = None
+    elif item.get("durationMs") is not None:
+        try:
+            duration = int(round(float(item["durationMs"]) / 1000))
+        except Exception:
+            duration = None
+    else:
+        milliseconds = (
+            nested_number(item, "duration", "totalMilliseconds")
+            or nested_number(item, "trackDuration", "totalMilliseconds")
+        )
+        if milliseconds:
+            duration = int(round(float(milliseconds) / 1000))
+        else:
+            seconds = nested_number(item, "consumptionExperienceTrait", "duration", "seconds")
+            if seconds:
+                duration = int(round(float(seconds)))
     title = title or "Titre inconnu"
     artist = artist or "Artiste inconnu"
-    return {
+    track_id = item.get("id") or spotify_id_from_uri(item.get("uri"))
+    normalized = {
         "query": f'"{artist}" "{title}" audio',
         "title": title,
         "artist": artist,
         "duration": duration,
-        "spotify_id": item.get("id"),
+        "spotify_id": track_id,
         "source": "spotify",
     }
+    thumbnail = spotify_thumbnail_from_entity(item)
+    if thumbnail:
+        normalized["thumbnail"] = thumbnail
+    return normalized
 
 
 def spotify_api_thumbnail(track):
@@ -857,6 +1247,169 @@ def normalize_spotify_api_item(item):
     if thumbnail:
         normalized["thumbnail"] = thumbnail
     return normalized
+
+
+def normalize_spotify_pathfinder_item(item):
+    if not isinstance(item, dict):
+        return None
+
+    if item.get("isLocal") or item.get("is_local"):
+        return None
+
+    candidate = item.get("itemV2")
+    if not isinstance(candidate, dict):
+        candidate = item.get("itemV3") if isinstance(item.get("itemV3"), dict) else None
+    if not isinstance(candidate, dict):
+        candidate = item.get("track") if isinstance(item.get("track"), dict) else None
+    if not isinstance(candidate, dict):
+        candidate = item
+
+    data = candidate.get("data") if isinstance(candidate.get("data"), dict) else candidate
+    if not isinstance(data, dict):
+        return None
+
+    if data.get("__typename") in {"NotFound", "Error"}:
+        return None
+
+    normalized = normalize_spotify_track(data)
+    uri = data.get("uri") or item.get("uri")
+    if uri and not normalized.get("spotify_id"):
+        normalized["spotify_id"] = spotify_id_from_uri(uri)
+
+    thumbnail = spotify_thumbnail_from_entity(data)
+    if thumbnail:
+        normalized["thumbnail"] = thumbnail
+
+    return normalized
+
+
+def fetch_spotify_playlist_tracks_pathfinder(playlist_id, access_token):
+    if not access_token:
+        return []
+
+    operation_hash = fetch_spotify_graphql_operation_hash("fetchPlaylist")
+    tracks = []
+    offset = 0
+    total = None
+    seen_uris = set()
+    refreshed_hash = False
+
+    headers = dict(SPOTIFY_HEADERS)
+    headers.update(
+        {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {access_token}",
+            "app-platform": "WebPlayer",
+            "Origin": SPOTIFY_WEB_TOKEN_REFERER,
+            "Referer": SPOTIFY_WEB_TOKEN_REFERER,
+        }
+    )
+
+    while True:
+        variables = {
+            "uri": f"spotify:playlist:{playlist_id}",
+            "offset": offset,
+            "limit": SPOTIFY_PATHFINDER_PAGE_SIZE,
+            "enableWatchFeedEntrypoint": False,
+        }
+        params = {
+            "operationName": "fetchPlaylist",
+            "variables": json.dumps(variables, separators=(",", ":")),
+            "extensions": json.dumps(
+                {
+                    "persistedQuery": {
+                        "version": 1,
+                        "sha256Hash": operation_hash,
+                    }
+                },
+                separators=(",", ":"),
+            ),
+        }
+
+        response = None
+        for attempt in range(SPOTIFY_API_MAX_RETRIES):
+            response = requests.post(
+                SPOTIFY_PATHFINDER_URL,
+                headers=headers,
+                params=params,
+                timeout=25,
+            )
+
+            if response.status_code != 429:
+                break
+
+            retry_after = response.headers.get("Retry-After")
+            try:
+                delay = int(retry_after) if retry_after else min(60, SPOTIFY_API_RETRY_BASE_SECONDS * (attempt + 1) * 2)
+            except Exception:
+                delay = min(60, SPOTIFY_API_RETRY_BASE_SECONDS * (attempt + 1) * 2)
+            if delay > SPOTIFY_API_MAX_RETRY_AFTER_SECONDS:
+                raise RuntimeError(
+                    f"Spotify Pathfinder rate-limit trop long ({delay}s). "
+                    "Le chemin API est abandonné pour éviter une attente excessive."
+                )
+            delay = max(3, delay)
+            print(f"    Spotify Pathfinder rate-limit : pause {delay}s")
+            time.sleep(delay)
+
+        if response is None:
+            break
+
+        if response.status_code in {400, 404} and not refreshed_hash:
+            body = response.text.lower()
+            if "persistedquery" in body or "hash" in body or "not found" in body:
+                invalidate_spotify_graphql_hash_cache("fetchPlaylist")
+                operation_hash = fetch_spotify_graphql_operation_hash("fetchPlaylist")
+                refreshed_hash = True
+                continue
+
+        if response.status_code == 429:
+            raise RuntimeError("Spotify Pathfinder rate-limit persistant.")
+
+        response.raise_for_status()
+        payload = response.json()
+        content = (
+            payload.get("data", {})
+            .get("playlistV2", {})
+            .get("content", {})
+        )
+        if not isinstance(content, dict):
+            raise RuntimeError("Réponse Spotify Pathfinder invalide.")
+
+        items = content.get("items") or []
+        total = content.get("totalCount") if isinstance(content.get("totalCount"), int) else total
+
+        page_count = 0
+        for raw_item in items:
+            track = normalize_spotify_pathfinder_item(raw_item)
+            if not track:
+                continue
+            uri = track.get("spotify_id")
+            if isinstance(uri, str) and uri in seen_uris:
+                continue
+            if isinstance(uri, str):
+                seen_uris.add(uri)
+            tracks.append(track)
+            page_count += 1
+
+        offset += len(items)
+        if total is not None:
+            print(f"    Spotify Pathfinder : {min(offset, total)}/{total} pistes")
+        if not items:
+            break
+        if total is not None:
+            if offset >= total:
+                break
+        elif len(items) < SPOTIFY_PATHFINDER_PAGE_SIZE:
+            break
+        if page_count == 0 and total is None:
+            break
+        time.sleep(SPOTIFY_PATHFINDER_PAGE_DELAY_SECONDS)
+
+    if total is not None and offset < total:
+        raise RuntimeError(f"Spotify Pathfinder a renvoyé une playlist partielle ({offset}/{total}).")
+
+    return tracks
 
 
 def fetch_spotify_playlist_tracks_api(playlist_id, access_token):
@@ -1082,13 +1635,27 @@ def resolve_spotify_tracks(public_url):
                 color = spotify_color_from_entity(entity)
                 access_token = extract_spotify_access_token(next_data)
                 client_token = None
+                web_token = None
                 if kind == "playlist":
                     try:
                         client_token = fetch_spotify_client_credentials_token()
                     except Exception as exc:
                         print(f"    API Spotify officielle indisponible : {exc}")
+                    try:
+                        web_token = fetch_spotify_web_access_token()
+                    except Exception as exc:
+                        print(f"    API Spotify web-player indisponible : {exc}")
 
                 if kind == "playlist":
+                    if web_token:
+                        try:
+                            api_tracks = fetch_spotify_playlist_tracks_pathfinder(item_id, web_token)
+                            if api_tracks:
+                                save_spotify_playlist_cache(item_id, api_tracks)
+                                return api_tracks
+                        except Exception as exc:
+                            print(f"    API Spotify Pathfinder indisponible : {exc}")
+
                     for token_label, token_value in (
                         ("officielle", client_token),
                         ("embed", access_token),
