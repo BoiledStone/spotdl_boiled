@@ -1,4 +1,4 @@
-# SpotDL Bot Resolver
+# Spotify Downloader Bot Resolver
 
 Résolveur local qui récupère les pistes d’une playlist Spotify, recherche une source audio YouTube fiable, puis enregistre les fichiers dans un dossier local. Les fichiers déjà présents sont conservés.
 
