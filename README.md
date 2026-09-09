@@ -91,6 +91,16 @@ SPOTDL_PLAYLIST_URL=https://open.spotify.com/playlist/ton-identifiant
 
 Une playlist indiquée avec `--playlist`, `-Playlist` dans PowerShell ou dans le champ de l’interface Windows remplace la valeur par défaut pour cette exécution seulement.
 
+### Changer le dossier de sortie par défaut
+
+Le dossier par défaut du projet est `.\downloads`. Pour utiliser un autre emplacement durablement, modifie `SPOTDL_OUTPUT_DIR` dans `.env`, par exemple :
+
+```dotenv
+SPOTDL_OUTPUT_DIR=D:/download
+```
+
+Un chemin absolu comme `D:/download` est recommandé sous Windows. L’option `--output`, `-Output` ou le champ de l’interface Windows remplace ce dossier pour une seule exécution.
+
 ## Utilisation
 
 ### Lanceur PowerShell recommandé
