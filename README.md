@@ -1,4 +1,4 @@
-# SpotDL Bot Resolver
+# Spotify Downloader Bot Resolver
 
 Résolveur local qui récupère les pistes d’une playlist Spotify, recherche une source audio YouTube fiable, puis enregistre les fichiers dans un dossier local. Les fichiers déjà présents sont conservés.
 
@@ -8,7 +8,7 @@ Prérequis :
 
 - Python 3.10 ou plus récent
 - FFmpeg accessible depuis le `PATH`
-- Firefox recommandé pour fournir des cookies navigateur à yt-dlp
+- Firefox connecté a youtube pour fournir des cookies navigateur à yt-dlp
 - Deno ou Node recommandé pour l’extraction YouTube récente de yt-dlp; Deno est détecté automatiquement
 
 `requirements.txt` installe aussi `yt-dlp-ejs`, utilisé avec le runtime JavaScript pour les signatures YouTube récentes.
