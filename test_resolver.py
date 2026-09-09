@@ -98,6 +98,14 @@ class ResolverParsingTests(unittest.TestCase):
         ):
             self.assertFalse(resolver.use_thread_pool())
 
+    def test_candidate_enrichment_is_cached_during_ranking(self):
+        candidate = {"id": "cached-video", "title": "Track", "duration": 180}
+        cache = {}
+        with patch.object(resolver, "enrich_entry", wraps=resolver.enrich_entry) as enrich:
+            resolver.pick_ranked([candidate], None, "Track", 180, "Track", enriched_cache=cache)
+            resolver.pick_ranked([candidate], None, "Track", 180, "Track", enriched_cache=cache)
+        self.assertEqual(enrich.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

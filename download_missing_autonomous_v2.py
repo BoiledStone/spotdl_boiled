@@ -308,7 +308,7 @@ def print_banner(playlist_url, output_dir, worker_count, total_tracks=None):
     print(style("├" + "─" * 66 + "┤", ANSI_CYAN))
     print(style(f"│ Output   : {fit_text(output_dir, 52):<52} │", ANSI_CYAN))
     print(style(f"│ Playlist : {fit_text(playlist_url, 52):<52} │", ANSI_CYAN))
-    workers_text = f"{worker_count} process{'es' if worker_count != 1 else ''}"
+    workers_text = f"{worker_count} worker{'s' if worker_count != 1 else ''}"
     print(style(f"│ Workers  : {fit_text(workers_text, 52):<52} │", ANSI_CYAN))
     if total_tracks is not None:
         print(style(f"│ Tracks   : {fit_text(total_tracks, 52):<52} │", ANSI_CYAN))
@@ -2312,7 +2312,9 @@ def youtube_search(query, count):
     return []
 
 
-def resolve_text_query_candidates(query_text, *, source="youtube", limit=5, enrich_limit=2):
+def resolve_text_query_candidates(
+    query_text, *, source="youtube", limit=5, enrich_limit=2, enriched_cache=None
+):
     query_value = str(query_text or "").strip()
     if not query_value:
         return []
@@ -2330,13 +2332,23 @@ def resolve_text_query_candidates(query_text, *, source="youtube", limit=5, enri
     if not entries:
         return []
 
-    ranked_entries = [entry for _, entry in pick_ranked(entries, artist=None, title=query_value, duration=None, query=query_value)]
+    ranked_entries = [
+        entry
+        for _, entry in pick_ranked(
+            entries,
+            artist=None,
+            title=query_value,
+            duration=None,
+            query=query_value,
+            enriched_cache=enriched_cache,
+        )
+    ]
     if not ranked_entries or enrich_limit <= 0:
         return ranked_entries
 
     enriched_entries = []
     for entry in ranked_entries[:max(1, int(enrich_limit))]:
-        enriched_entries.append(enrich_entry(entry))
+        enriched_entries.append(enrich_cached_entry(entry, enriched_cache))
 
     merged_entries = []
     seen_keys = set()
@@ -2350,7 +2362,17 @@ def resolve_text_query_candidates(query_text, *, source="youtube", limit=5, enri
             seen_keys.add(key)
         merged_entries.append(entry)
 
-    return [entry for _, entry in pick_ranked(merged_entries, artist=None, title=query_value, duration=None, query=query_value)] or merged_entries
+    return [
+        entry
+        for _, entry in pick_ranked(
+            merged_entries,
+            artist=None,
+            title=query_value,
+            duration=None,
+            query=query_value,
+            enriched_cache=enriched_cache,
+        )
+    ] or merged_entries
 
 
 def enrich_entry(entry):
@@ -2428,10 +2450,24 @@ def candidate_identity(candidate):
     return f"url:{url.split('#', 1)[0].rstrip('/').lower()}"
 
 
-def pick_ranked(entries, artist, title, duration, query):
+def enrich_cached_entry(entry, enriched_cache=None):
+    if enriched_cache is None:
+        return enrich_entry(entry)
+
+    cache_key = candidate_identity(entry)
+    if cache_key in enriched_cache:
+        return enriched_cache[cache_key]
+
+    candidate = enrich_entry(entry)
+    if cache_key:
+        enriched_cache[cache_key] = candidate
+    return candidate
+
+
+def pick_ranked(entries, artist, title, duration, query, *, enriched_cache=None):
     scored = []
     for entry in entries:
-        candidate = enrich_entry(entry)
+        candidate = enrich_cached_entry(entry, enriched_cache)
         score = score_youtube_candidate(
             candidate,
             title=title,
@@ -2453,7 +2489,14 @@ def resolve_youtube(artist, title, duration, *, excluded_urls=None):
     }
 
     def rank_available(entries, query):
-        ranked = pick_ranked(entries, expected_artist, expected_title, duration, query)
+        ranked = pick_ranked(
+            entries,
+            expected_artist,
+            expected_title,
+            duration,
+            query,
+            enriched_cache=enriched_cache,
+        )
         if not excluded_ids:
             return ranked
         return [
@@ -2465,6 +2508,7 @@ def resolve_youtube(artist, title, duration, *, excluded_urls=None):
     expected_artist = simplify_track_title(artist)
     expected_title = simplify_track_title(title)
     simplified_title = simplify_track_title(expected_title)
+    enriched_cache = {}
 
     if expected_artist and expected_title:
         primary_queries = [
@@ -2580,7 +2624,7 @@ def resolve_youtube(artist, title, duration, *, excluded_urls=None):
             f"{expected_artist} {expected_title}",
             f"{expected_title} {expected_artist}",
         ])
-    if expected_title:
+    if expected_title and not expected_artist:
         fallback_searches.append(expected_title)
     if artist and title:
         fallback_searches.append(query if (query := f"{artist} {title}".strip()) else "")
@@ -2595,8 +2639,9 @@ def resolve_youtube(artist, title, duration, *, excluded_urls=None):
         fallback_entries = resolve_text_query_candidates(
             search_text,
             source="spotify",
-            limit=max(6, STRICT_SLOW_SEARCH_SIZE + 3),
-            enrich_limit=3,
+            limit=max(5, STRICT_SLOW_SEARCH_SIZE + 2),
+            enrich_limit=1,
+            enriched_cache=enriched_cache,
         )
         if not fallback_entries:
             continue
