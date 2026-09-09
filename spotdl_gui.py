@@ -75,7 +75,7 @@ class ResolverApp:
         try:
             return min(5, max(1, int(raw)))
         except (TypeError, ValueError):
-            return 4
+            return 2
 
     def _configure_style(self):
         style = ttk.Style(self.root)

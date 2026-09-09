@@ -1,5 +1,5 @@
 import argparse
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import io
 import hashlib
 import hmac
@@ -97,7 +97,7 @@ MIN_FALLBACK_ACCEPT_SCORE = read_int_env("SPOTDL_MIN_FALLBACK_SCORE", 130, minim
 MAX_DOWNLOAD_CANDIDATE_ATTEMPTS = read_int_env(
     "SPOTDL_MAX_CANDIDATE_ATTEMPTS", 6, minimum=1, maximum=8
 )
-DEFAULT_CONCURRENT_TRACKS = read_int_env("SPOTDL_WORKERS", 4, minimum=1, maximum=5)
+DEFAULT_CONCURRENT_TRACKS = read_int_env("SPOTDL_WORKERS", 2, minimum=1, maximum=5)
 
 AUDIO_EXTENSIONS = {".opus", ".mp3", ".m4a", ".flac", ".wav", ".ogg", ".aac", ".webm"}
 MAX_FILENAME_COMPONENT_LENGTH = 120
@@ -2699,6 +2699,11 @@ def initialize_worker(output_dir, capture_logs):
     WORKER_CAPTURE_LOGS = capture_logs
 
 
+def use_thread_pool():
+    """Avoid Windows spawn failures when the resolver is hosted by pythonw.exe."""
+    return os.name == "nt" and Path(sys.executable).stem.lower() == "pythonw"
+
+
 def process_missing_track(track, index, total):
     buffer = io.StringIO()
     artist = track.get("artist") or "Artiste inconnu"
@@ -2966,9 +2971,11 @@ def main(argv=None):
     worker_count = requested_workers
     worker_count = min(worker_count, len(missing))
     print_banner(PLAYLIST_URL, OUTPUT_DIR, worker_count, len(missing))
-    print(style(f"Travail en parallèle : {worker_count} processus", ANSI_DIM))
     if worker_count == 1:
         print(style("Mode séquentiel : détail de la piste affiché en direct.", ANSI_DIM))
+    else:
+        parallel_label = "threads" if use_thread_pool() else "processus"
+        print(style(f"Travail en parallèle : {worker_count} {parallel_label}", ANSI_DIM))
     print()
 
     start_time = time.time()
@@ -3008,11 +3015,24 @@ def main(argv=None):
                 )
                 break
     else:
-        with ProcessPoolExecutor(
-            max_workers=worker_count,
-            initializer=initialize_worker,
-            initargs=(str(OUTPUT_DIR), True),
-        ) as executor:
+        thread_pool = parallel_label == "threads"
+        if thread_pool:
+            # pythonw.exe has no console and can terminate spawned workers on Windows.
+            # The resolver is I/O-bound, so threads preserve concurrency without spawn.
+            WORKER_CAPTURE_LOGS = False
+            executor_factory = ThreadPoolExecutor
+            executor_options = {"max_workers": worker_count}
+            parallel_label = "threads"
+        else:
+            executor_factory = ProcessPoolExecutor
+            executor_options = {
+                "max_workers": worker_count,
+                "initializer": initialize_worker,
+                "initargs": (str(OUTPUT_DIR), True),
+            }
+            parallel_label = "processus"
+
+        with executor_factory(**executor_options) as executor:
             future_tracks = {
                 executor.submit(process_missing_track, track, index, len(missing)): track
                 for index, track in enumerate(missing, 1)

@@ -1,6 +1,7 @@
 import importlib.util
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from spotdl_gui import build_resolver_command
 
@@ -85,6 +86,17 @@ class ResolverParsingTests(unittest.TestCase):
                 "3",
             ],
         )
+
+    def test_thread_pool_switch_targets_pythonw_on_windows(self):
+        with patch.object(resolver.os, "name", "nt"), patch.object(
+            resolver.sys, "executable", r"C:\Python312\pythonw.exe"
+        ):
+            self.assertTrue(resolver.use_thread_pool())
+
+        with patch.object(resolver.os, "name", "nt"), patch.object(
+            resolver.sys, "executable", r"C:\Python312\python.exe"
+        ):
+            self.assertFalse(resolver.use_thread_pool())
 
 
 if __name__ == "__main__":

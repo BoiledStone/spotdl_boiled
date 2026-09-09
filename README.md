@@ -48,7 +48,7 @@ Le fichier `.env` est optionnel. Il permet d’éviter de répéter les paramèt
 ```dotenv
 SPOTDL_PLAYLIST_URL=https://open.spotify.com/playlist/...
 SPOTDL_OUTPUT_DIR=.\downloads
-SPOTDL_WORKERS=4
+SPOTDL_WORKERS=2
 SPOTDL_MAX_CANDIDATE_ATTEMPTS=6
 # Facultatif: Firefox est détecté automatiquement si un profil local existe.
 # Définis une valeur vide pour désactiver cette détection.
@@ -62,7 +62,7 @@ Variables disponibles :
 | --- | --- | --- |
 | `SPOTDL_PLAYLIST_URL` | URL, URI ou identifiant de playlist Spotify | aucun |
 | `SPOTDL_OUTPUT_DIR` | dossier de sortie | `downloads` |
-| `SPOTDL_WORKERS` | pistes traitées en parallèle, de 1 à 5 | `4` |
+| `SPOTDL_WORKERS` | pistes traitées en parallèle, de 1 à 5 | `2` |
 | `SPOTDL_MAX_CANDIDATE_ATTEMPTS` | candidats YouTube essayés après un téléchargement invalide, de 1 à 8 | `6` |
 | `SPOTDL_MIN_FALLBACK_SCORE` | score minimal du fallback YouTube | `130` |
 | `BOT_YTDLP_COOKIES_BROWSER` | navigateur utilisé pour les cookies yt-dlp | `firefox` si un profil local est détecté, sinon désactivé |
@@ -91,10 +91,10 @@ Le lanceur vérifie Python, affiche les paramètres actifs et relaie le code ret
 .\download_playlist.ps1 `
   -Playlist "https://open.spotify.com/playlist/..." `
   -Output ".\downloads" `
-  -Workers 4
+  -Workers 2
 ```
 
-`-Workers` accepte une valeur de `1` à `5`. Avec `-Workers 1`, le traitement est réellement séquentiel: aucun processus enfant n’est créé et le détail de la recherche reste visible en direct. Une valeur explicite hors de cette plage est refusée avec le code `2`.
+`-Workers` accepte une valeur de `1` à `5`. Avec `-Workers 1`, le traitement est réellement séquentiel: aucun worker enfant n’est créé et le détail de la recherche reste visible en direct. En mode console, les workers parallèles utilisent des processus; l’interface Windows utilise automatiquement des threads avec `pythonw.exe` pour éviter les erreurs de démarrage du multiprocessing Windows. Une valeur explicite hors de cette plage est refusée avec le code `2`.
 
 ### Exécution directe
 
@@ -102,7 +102,7 @@ Le lanceur vérifie Python, affiche les paramètres actifs et relaie le code ret
 python .\download_missing_autonomous_v2.py `
   --playlist "https://open.spotify.com/playlist/..." `
   --output ".\downloads" `
-  --workers 4
+  --workers 2
 ```
 
 Le script accepte aussi les liens copiés sous forme Markdown, par exemple `[ma playlist](https://open.spotify.com/playlist/...)`.
