@@ -2,6 +2,8 @@ import importlib.util
 import unittest
 from pathlib import Path
 
+from spotdl_gui import build_resolver_command
+
 
 MODULE_PATH = Path(__file__).with_name("download_missing_autonomous_v2.py")
 SPEC = importlib.util.spec_from_file_location("spotdl_resolver", MODULE_PATH)
@@ -35,6 +37,15 @@ class ResolverParsingTests(unittest.TestCase):
             "Beyonce Live Track",
         )
 
+    def test_bounds_long_audio_filename_components(self):
+        value = resolver.normalize_filename("x" * 300)
+        self.assertLessEqual(value, "x" * resolver.MAX_FILENAME_COMPONENT_LENGTH)
+        self.assertEqual(len(value), resolver.MAX_FILENAME_COMPONENT_LENGTH)
+        self.assertEqual(
+            resolver.audio_output_stem("", ""),
+            "Artiste inconnu - Titre inconnu",
+        )
+
     def test_parses_duration_variants(self):
         self.assertEqual(resolver.coerce_duration_seconds("3:05"), 185)
         self.assertEqual(resolver.coerce_duration_seconds("1:02:03"), 3723)
@@ -51,6 +62,28 @@ class ResolverParsingTests(unittest.TestCase):
             resolver.is_fallback_candidate_acceptable(
                 candidate, 100, "Artist", "Track", 180
             )
+        )
+
+    def test_gui_builds_argument_list_without_shell_interpolation(self):
+        command = build_resolver_command(
+            "python.exe",
+            "download_missing_autonomous_v2.py",
+            "https://open.spotify.com/playlist/example",
+            ".\\downloads",
+            3,
+        )
+        self.assertEqual(
+            command,
+            [
+                "python.exe",
+                "download_missing_autonomous_v2.py",
+                "--playlist",
+                "https://open.spotify.com/playlist/example",
+                "--output",
+                ".\\downloads",
+                "--workers",
+                "3",
+            ],
         )
 
 

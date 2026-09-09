@@ -33,6 +33,8 @@ Pour exécuter les tests locaux, sans appel réseau ni modification des téléch
 python -m unittest -v .\test_resolver.py
 ```
 
+Pour utiliser l’interface Windows, double-clique sur `spotdl_gui.pyw`. Elle permet de choisir la playlist, le dossier de sortie et le nombre de workers, puis affiche le journal du resolver en direct. Python doit être installé avec Tkinter, ce qui est inclus dans l’installation Windows standard de Python.
+
 Si PowerShell bloque les scripts dans la session courante :
 
 ```powershell
@@ -153,6 +155,8 @@ Extensions audio reconnues : `.opus`, `.mp3`, `.m4a`, `.flac`, `.wav`, `.ogg`, `
 
 - `download_missing_autonomous_v2.py` : resolver principal
 - `download_playlist.ps1` : lanceur PowerShell recommandé
+- `spotdl_gui.pyw` : interface Windows lançable par double-clic
+- `spotdl_gui.py` : logique de l’interface et lancement du resolver
 - `.env.example` : modèle de configuration
 - `requirements.txt` : dépendances Python
 - `test_resolver.py` : tests rapides du parsing, du matching et des noms de fichiers

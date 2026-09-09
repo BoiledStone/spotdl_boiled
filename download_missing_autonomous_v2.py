@@ -100,6 +100,7 @@ MAX_DOWNLOAD_CANDIDATE_ATTEMPTS = read_int_env(
 DEFAULT_CONCURRENT_TRACKS = read_int_env("SPOTDL_WORKERS", 4, minimum=1, maximum=5)
 
 AUDIO_EXTENSIONS = {".opus", ".mp3", ".m4a", ".flac", ".wav", ".ogg", ".aac", ".webm"}
+MAX_FILENAME_COMPONENT_LENGTH = 120
 YOUTUBE_YTDL_PLAYER_CLIENTS = ("default", "web_safari")
 YOUTUBE_YTDL_FALLBACK_CLIENTS = (("web_safari",),)
 YOUTUBE_AUTH_ERROR_MARKERS = (
@@ -2117,7 +2118,17 @@ def normalize_filename(value):
     text = "".join(c for c in text if not unicodedata.combining(c))
     text = re.sub(r"[<>:\"/\\|?*]", " ", text)
     text = re.sub(r"\s+", " ", text)
-    return text.strip()
+    text = text.strip().rstrip(".")
+    if len(text) > MAX_FILENAME_COMPONENT_LENGTH:
+        digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
+        text = f"{text[:MAX_FILENAME_COMPONENT_LENGTH - 9].rstrip()}-{digest}"
+    return text
+
+
+def audio_output_stem(artist, title):
+    safe_artist = normalize_filename(artist) or "Artiste inconnu"
+    safe_title = normalize_filename(title) or "Titre inconnu"
+    return f"{safe_artist} - {safe_title}"
 
 
 def build_existing_index():
@@ -2635,14 +2646,13 @@ def download_audio(candidate, artist, title):
     if not url:
         return False, "missing_url"
 
-    safe_artist = normalize_filename(artist)
-    safe_title = normalize_filename(title)
-    outtmpl = str(OUTPUT_DIR / f"{safe_artist} - {safe_title}.%(ext)s")
+    output_stem = audio_output_stem(artist, title)
+    outtmpl = str(OUTPUT_DIR / f"{output_stem}.%(ext)s")
 
     # Protection supplémentaire : ne pas remplacer un fichier existant.
     existing_target = None
     for ext in AUDIO_EXTENSIONS:
-        candidate_path = OUTPUT_DIR / f"{safe_artist} - {safe_title}{ext}"
+        candidate_path = OUTPUT_DIR / f"{output_stem}{ext}"
         if candidate_path.exists():
             existing_target = candidate_path
             break
@@ -2672,7 +2682,7 @@ def download_audio(candidate, artist, title):
 
         # Vérification post-téléchargement après chaque profil yt-dlp.
         for ext in AUDIO_EXTENSIONS:
-            if (OUTPUT_DIR / f"{safe_artist} - {safe_title}{ext}").exists():
+            if (OUTPUT_DIR / f"{output_stem}{ext}").exists():
                 return True, None
 
     if last_error is not None:
@@ -2862,7 +2872,7 @@ def consume_track_result(result, failed, completed, total, existing):
 
     if result.get("ok"):
         expected_name = normalize_search_text(f"{result['artist']} - {result['title']}")
-        existing[expected_name] = OUTPUT_DIR / f"{normalize_filename(result['artist'])} - {normalize_filename(result['title'])}.opus"
+        existing[expected_name] = OUTPUT_DIR / f"{audio_output_stem(result['artist'], result['title'])}.opus"
         return True, None
 
     cause = result_error or "download_failed"
