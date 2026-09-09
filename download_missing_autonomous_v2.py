@@ -1,19 +1,24 @@
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import io
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
+import shutil
 import sys
 import struct
 import time
 import unicodedata
-from contextlib import suppress
+from contextlib import nullcontext, redirect_stderr, redirect_stdout, suppress
 from datetime import timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from html import unescape
 from urllib.parse import quote, urlparse
+from textwrap import indent
 
 import requests
 import yt_dlp
@@ -28,11 +33,27 @@ ENV_FILE = Path(os.getenv("BOT_ENV_FILE") or (PROJECT_DIR / ".env"))
 DEFAULT_OUTPUT_DIR = Path(os.getenv("SPOTDL_OUTPUT_DIR") or (PROJECT_DIR / "downloads"))
 DEFAULT_PLAYLIST_URL = os.getenv("SPOTDL_PLAYLIST_URL") or ""
 
-# Ton bot utilise Firefox pour yt-dlp.
-YTDLP_COOKIES_BROWSER = (os.getenv("BOT_YTDLP_COOKIES_BROWSER") or "firefox").strip().lower()
 if ENV_FILE.exists():
     load_dotenv(ENV_FILE)
-YTDLP_COOKIES_BROWSER = (os.getenv("BOT_YTDLP_COOKIES_BROWSER") or "firefox").strip().lower()
+
+
+def default_ytdlp_cookies_browser():
+    configured_browser = os.getenv("BOT_YTDLP_COOKIES_BROWSER")
+    if configured_browser is not None:
+        return configured_browser.strip().lower()
+
+    appdata = os.getenv("APPDATA")
+    if not appdata:
+        return ""
+
+    firefox_profiles = Path(appdata) / "Mozilla" / "Firefox" / "Profiles"
+    with suppress(OSError):
+        if firefox_profiles.is_dir() and any(firefox_profiles.iterdir()):
+            return "firefox"
+    return ""
+
+
+YTDLP_COOKIES_BROWSER = default_ytdlp_cookies_browser()
 OUTPUT_DIR = Path(os.getenv("SPOTDL_OUTPUT_DIR") or DEFAULT_OUTPUT_DIR)
 PLAYLIST_URL = os.getenv("SPOTDL_PLAYLIST_URL") or DEFAULT_PLAYLIST_URL
 
@@ -43,20 +64,142 @@ YOUTUBE_EARLY_ACCEPT_SCORE = 145
 YOUTUBE_EARLY_ACCEPT_MARGIN = 16
 STRICT_SLOW_SEARCH_SIZE = 3
 
+
+def read_int_env(name, default, *, minimum=None, maximum=None):
+    try:
+        value = int(os.getenv(name) or default)
+    except (TypeError, ValueError):
+        value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def read_float_env(name, default, *, minimum=None, maximum=None):
+    try:
+        value = float(os.getenv(name) or default)
+    except (TypeError, ValueError):
+        value = default
+    if not math.isfinite(value):
+        value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+MIN_FALLBACK_ACCEPT_SCORE = read_int_env("SPOTDL_MIN_FALLBACK_SCORE", 130, minimum=0)
+MAX_DOWNLOAD_CANDIDATE_ATTEMPTS = read_int_env(
+    "SPOTDL_MAX_CANDIDATE_ATTEMPTS", 6, minimum=1, maximum=8
+)
+DEFAULT_CONCURRENT_TRACKS = read_int_env("SPOTDL_WORKERS", 4, minimum=1, maximum=5)
+
 AUDIO_EXTENSIONS = {".opus", ".mp3", ".m4a", ".flac", ".wav", ".ogg", ".aac", ".webm"}
+YOUTUBE_YTDL_PLAYER_CLIENTS = ("default", "web_safari")
+YOUTUBE_YTDL_FALLBACK_CLIENTS = (("web_safari",),)
+YOUTUBE_AUTH_ERROR_MARKERS = (
+    "sign in to confirm you're not a bot",
+    "sign in to confirm you’re not a bot",
+    "confirm you're not a bot",
+    "confirm you’re not a bot",
+    "not a bot",
+    "cookies-from-browser or --cookies",
+)
+
+
+def detect_ytdlp_js_runtimes():
+    """Return a JavaScript runtime that yt-dlp can actually execute."""
+    configured = os.getenv("BOT_YTDLP_JS_RUNTIME", "").strip()
+    if configured:
+        if os.name == "nt" and len(configured) > 2 and configured[1] == ":":
+            runtime_name, runtime_path = configured.split(":", 1)
+        elif ":" in configured:
+            runtime_name, runtime_path = configured.split(":", 1)
+        else:
+            runtime_name, runtime_path = configured, ""
+        runtime_name = runtime_name.strip().lower()
+        if runtime_name in {"deno", "node", "quickjs", "bun"}:
+            return {runtime_name: {"path": runtime_path.strip() or None}}
+
+    for executable, runtime_name in (
+        ("deno", "deno"),
+        ("node", "node"),
+        ("qjs", "quickjs"),
+        ("quickjs", "quickjs"),
+        ("bun", "bun"),
+    ):
+        runtime_path = shutil.which(executable)
+        if runtime_path:
+            return {runtime_name: {"path": runtime_path}}
+    return {}
+
+
+YTDLP_JS_RUNTIMES = detect_ytdlp_js_runtimes()
+try:
+    from importlib import metadata as importlib_metadata
+except ImportError:
+    importlib_metadata = None
+
+if importlib_metadata is None:
+    YTDLP_EJS_PACKAGE_INSTALLED = False
+else:
+    try:
+        importlib_metadata.version("yt-dlp-ejs")
+    except importlib_metadata.PackageNotFoundError:
+        YTDLP_EJS_PACKAGE_INSTALLED = False
+    else:
+        YTDLP_EJS_PACKAGE_INSTALLED = True
+YTDLP_REMOTE_EJS = (
+    os.getenv("BOT_YTDLP_REMOTE_EJS", "").strip().lower() in {"1", "true", "yes", "on"}
+    or (not YTDLP_EJS_PACKAGE_INSTALLED and bool(YTDLP_JS_RUNTIMES))
+)
+
+
+class YouTubeAuthenticationRequired(RuntimeError):
+    """Raised when YouTube refuses extraction without an authenticated session."""
+
+
+def is_youtube_auth_error(error):
+    error_text = str(error or "").lower()
+    return any(marker in error_text for marker in YOUTUBE_AUTH_ERROR_MARKERS)
+
+
+class YtdlpLogCollector:
+    def __init__(self):
+        self.authentication_error = None
+
+    def _inspect(self, message):
+        if self.authentication_error is None and is_youtube_auth_error(message):
+            self.authentication_error = str(message)
+
+    def debug(self, message):
+        self._inspect(message)
+
+    def warning(self, message):
+        self._inspect(message)
+
+    def error(self, message):
+        self._inspect(message)
 SPOTIFY_API_PAGE_SIZE = 100
 SPOTIFY_API_MAX_RETRIES = 3
 SPOTIFY_API_RETRY_BASE_SECONDS = 2
 SPOTIFY_API_PAGE_DELAY_SECONDS = 1.0
-SPOTIFY_API_MAX_RETRY_AFTER_SECONDS = int(os.getenv("SPOTIFY_API_MAX_RETRY_AFTER_SECONDS") or 30)
+SPOTIFY_API_MAX_RETRY_AFTER_SECONDS = read_int_env(
+    "SPOTIFY_API_MAX_RETRY_AFTER_SECONDS", 30, minimum=0
+)
 SPOTIFY_WEB_TOKEN_URL = "https://open.spotify.com/api/token"
 SPOTIFY_WEB_TOKEN_REFERER = "https://open.spotify.com/"
 SPOTIFY_SERVER_TIME_URL = "https://open.spotify.com/"
 SPOTIFY_PATHFINDER_URL = "https://api-partner.spotify.com/pathfinder/v1/query"
 SPOTIFY_TOTP_SECRETS_URL = os.getenv("SPOTIFY_TOTP_SECRETS_URL") or "https://github.com/xyloflake/spot-secrets-go/blob/main/secrets/secretDict.json?raw=true"
-SPOTIFY_TOTP_TIMEOUT_SECONDS = int(os.getenv("SPOTIFY_TOTP_TIMEOUT_SECONDS") or 10)
-SPOTIFY_PATHFINDER_PAGE_SIZE = int(os.getenv("SPOTIFY_PATHFINDER_PAGE_SIZE") or 200)
-SPOTIFY_PATHFINDER_PAGE_DELAY_SECONDS = float(os.getenv("SPOTIFY_PATHFINDER_PAGE_DELAY_SECONDS") or 0.2)
+SPOTIFY_TOTP_TIMEOUT_SECONDS = read_int_env("SPOTIFY_TOTP_TIMEOUT_SECONDS", 10, minimum=1)
+SPOTIFY_PATHFINDER_PAGE_SIZE = read_int_env("SPOTIFY_PATHFINDER_PAGE_SIZE", 200, minimum=1)
+SPOTIFY_PATHFINDER_PAGE_DELAY_SECONDS = read_float_env(
+    "SPOTIFY_PATHFINDER_PAGE_DELAY_SECONDS", 0.2, minimum=0
+)
 SPOTIFY_SP_DC = os.getenv("SPOTIFY_SP_DC") or ""
 SPOTIFY_PLAYLIST_CACHE_DIRNAME = ".spotify_cache"
 SPOTIFY_TOTP_SECRET_CIPHER_DICT = {
@@ -97,22 +240,95 @@ SPOTIFY_PUBLIC_HEADER_VARIANTS = [
     dict(SPOTIFY_HEADERS, **{"Accept-Language": "en-US,en;q=0.9"}),
 ]
 
+ANSI_ENABLED = bool(sys.stdout.isatty() and os.getenv("NO_COLOR") is None)
+ANSI_RESET = "\033[0m"
+ANSI_BOLD = "\033[1m"
+ANSI_DIM = "\033[2m"
+ANSI_CYAN = "\033[36m"
+ANSI_GREEN = "\033[32m"
+ANSI_YELLOW = "\033[33m"
+ANSI_RED = "\033[31m"
+ANSI_MAGENTA = "\033[35m"
+WORKER_CAPTURE_LOGS = True
+
+
+def style(text, *codes):
+    if not ANSI_ENABLED or not codes:
+        return text
+    return f"{''.join(codes)}{text}{ANSI_RESET}"
+
+
+def fit_text(text, width):
+    text = str(text)
+    if len(text) <= width:
+        return text
+    if width <= 3:
+        return text[:width]
+    left = max(1, (width - 3) // 2)
+    right = max(1, width - 3 - left)
+    return f"{text[:left]}...{text[-right:]}"
+
+
+def safe_print(*args, **kwargs):
+    try:
+        print(*args, **kwargs)
+    except UnicodeEncodeError:
+        stream = kwargs.get("file", sys.stdout)
+        separator = kwargs.get("sep", " ")
+        end = kwargs.get("end", "\n")
+        text = separator.join(str(arg) for arg in args) + end
+        encoding = getattr(stream, "encoding", None) or "utf-8"
+        encoded = text.encode(encoding, errors="replace")
+        stream_buffer = getattr(stream, "buffer", None)
+        if stream_buffer is not None:
+            stream_buffer.write(encoded)
+            stream_buffer.flush()
+        else:
+            stream.write(encoded.decode(encoding, errors="replace"))
+            stream.flush()
+
+
+def format_progress(completed, total, width=24):
+    total = max(1, int(total))
+    completed = max(0, min(int(completed), total))
+    filled = int(round(width * (completed / total)))
+    bar = "█" * filled + "░" * (width - filled)
+    percent = int(round(100 * completed / total))
+    return f"[{bar}] {completed}/{total} ({percent:>3}%)"
+
+
+def print_banner(playlist_url, output_dir, worker_count, total_tracks=None):
+    print(style("┌" + "─" * 66 + "┐", ANSI_CYAN))
+    print(style(f"│ {fit_text('SPOTIFY -> YOUTUBE -> OPUS | Resolver multi-process', 64):<64} │", ANSI_CYAN))
+    print(style("├" + "─" * 66 + "┤", ANSI_CYAN))
+    print(style(f"│ Output   : {fit_text(output_dir, 52):<52} │", ANSI_CYAN))
+    print(style(f"│ Playlist : {fit_text(playlist_url, 52):<52} │", ANSI_CYAN))
+    workers_text = f"{worker_count} process{'es' if worker_count != 1 else ''}"
+    print(style(f"│ Workers  : {fit_text(workers_text, 52):<52} │", ANSI_CYAN))
+    if total_tracks is not None:
+        print(style(f"│ Tracks   : {fit_text(total_tracks, 52):<52} │", ANSI_CYAN))
+    print(style("└" + "─" * 66 + "┘", ANSI_CYAN))
+
 # ============================================================
 # TEXTE / MATCHING — repris de ton bot
 # ============================================================
 
 def clean_spotify_text(value):
-    if value is None:
-        return ""
+    if not value:
+        return None
     text = str(value).strip()
-    return re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s*\|\s*Spotify\s*$", "", text, flags=re.I)
+    text = text.replace("â€“", "-").replace("Â·", "·")
+    return text.strip() or None
 
 
 def normalize_search_text(value):
     if not value:
         return ""
-    text = str(value).lower()
-    text = re.sub(r"[^a-z0-9]+", " ", text)
+    text = unicodedata.normalize("NFKD", str(value).lower())
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    text = unicodedata.normalize("NFC", text)
+    text = re.sub(r"[\W_]+", " ", text, flags=re.UNICODE)
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -146,13 +362,69 @@ def simplify_track_title(value):
     return text.strip() or value
 
 
+def token_overlap_score(expected, haystack):
+    expected_tokens = [token for token in normalize_search_text(expected).split() if len(token) > 2]
+    if not expected_tokens:
+        return 0, 0
+    haystack_tokens = normalized_token_set(haystack)
+    matched = sum(1 for token in expected_tokens if token in haystack_tokens)
+    return matched, len(expected_tokens)
+
+
+def build_candidate_blob(candidate):
+    return " ".join([
+        candidate.get("title") or "",
+        candidate.get("track") or "",
+        candidate.get("artist") or "",
+        candidate.get("uploader") or "",
+        candidate.get("channel") or "",
+        candidate.get("description") or "",
+        candidate.get("album") or "",
+    ])
+
+
+def is_fallback_candidate_acceptable(candidate, score, artist, title, duration):
+    if not candidate or score is None:
+        return False
+    if score >= STRICT_FAST_ACCEPT_SCORE:
+        return True
+
+    # User-uploaded music often has no artist field. A full title match backed
+    # by a close Spotify duration is safer than rejecting it for an unknown
+    # uploader, while obvious alternate edits remain excluded.
+    if has_reliable_title_duration_anchor(candidate, artist, title, duration):
+        return True
+    if score < MIN_FALLBACK_ACCEPT_SCORE:
+        return False
+
+    blob = build_candidate_blob(candidate)
+    title_match, title_total = token_overlap_score(title, blob)
+    artist_match, artist_total = token_overlap_score(artist, blob)
+    title_threshold = max(1, title_total // 2) if title_total else 0
+    artist_threshold = max(1, artist_total // 2) if artist_total else 0
+
+    if title_total and title_match < title_threshold:
+        return False
+    if artist_total and artist_match < artist_threshold:
+        return False
+
+    candidate_duration = coerce_duration_seconds(candidate.get("duration"))
+    duration_seconds = coerce_duration_seconds(duration)
+    if isinstance(candidate_duration, int) and isinstance(duration_seconds, int):
+        if abs(candidate_duration - duration_seconds) > 30 and score < STRICT_FAST_ACCEPT_SCORE:
+            return False
+
+    return True
+
+
 def coerce_duration_seconds(value):
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        if value <= 0:
+        numeric_value = float(value)
+        if not math.isfinite(numeric_value) or numeric_value <= 0:
             return None
-        return int(round(float(value)))
+        return int(round(numeric_value))
     text = str(value).strip()
     if not text:
         return None
@@ -166,6 +438,55 @@ def coerce_duration_seconds(value):
         if len(parts) == 3 and all(p.isdigit() for p in parts):
             return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
     return None
+
+
+def has_reliable_title_duration_anchor(candidate, artist, title, duration):
+    candidate_title = normalize_search_text(" ".join([
+        candidate.get("title") or "",
+        candidate.get("track") or "",
+    ]))
+    title_match, title_total = token_overlap_score(title, candidate_title)
+    if title_total < 2 or title_match < title_total:
+        return False
+
+    candidate_duration = coerce_duration_seconds(candidate.get("duration"))
+    duration_seconds = coerce_duration_seconds(duration)
+    if not isinstance(candidate_duration, int) or not isinstance(duration_seconds, int):
+        return False
+    if abs(candidate_duration - duration_seconds) > 10:
+        return False
+
+    expected_title = normalize_search_text(title)
+    quality_terms = (
+        "lyrics",
+        "lyric video",
+        "sped up",
+        "slowed",
+        "nightcore",
+        "8d",
+        "live",
+        "cover",
+        "karaoke",
+        "instrumental",
+        "muffled",
+        "reverb",
+        "remix",
+        "loop",
+        "full album",
+        "playlist",
+    )
+    if any(term in candidate_title and term not in expected_title for term in quality_terms):
+        return False
+
+    explicit_artist = clean_spotify_text(candidate.get("artist"))
+    return not explicit_artist or has_any_token_match(artist, explicit_artist)
+
+
+def first_acceptable_ranked(ranked, artist, title, duration):
+    for score, candidate in ranked:
+        if is_fallback_candidate_acceptable(candidate, score, artist, title, duration):
+            return score, candidate
+    return None, None
 
 # ============================================================
 # SCORE YOUTUBE — repris de ton bot
@@ -197,6 +518,12 @@ def score_youtube_candidate(entry, *, title=None, artist=None, duration=None, qu
     haystack_tokens = normalized_token_set(haystack)
     explicit_artist = clean_spotify_text(entry.get("artist"))
     explicit_channel = clean_spotify_text(entry.get("channel") or entry.get("uploader"))
+    title_duration_anchor = has_reliable_title_duration_anchor(
+        entry,
+        artist,
+        title,
+        duration,
+    )
     score = 0
     title_matches, title_total = token_match_count(title, haystack)
     artist_matches, artist_total = token_match_count(artist, haystack)
@@ -248,7 +575,7 @@ def score_youtube_candidate(entry, *, title=None, artist=None, duration=None, qu
             if is_strong_token_match(artist, explicit_channel):
                 score += 60
             elif not has_any_token_match(artist, explicit_channel):
-                score -= 35
+                score -= 10 if title_duration_anchor else 35
 
     if query_tokens:
         matched = sum(1 for token in query_tokens if token in haystack_tokens)
@@ -272,7 +599,9 @@ def score_youtube_candidate(entry, *, title=None, artist=None, duration=None, qu
 
     if "provided to youtube by" in haystack:
         score += 35
-    if entry.get("uploader", "").endswith(" - Topic") or entry.get("channel", "").endswith(" - Topic"):
+    uploader = str(entry.get("uploader") or "")
+    channel = str(entry.get("channel") or "")
+    if uploader.endswith(" - Topic") or channel.endswith(" - Topic"):
         score += 20
     if title_text and artist_text:
         if normalize_search_text(entry.get("track")) == title_text:
@@ -281,14 +610,20 @@ def score_youtube_candidate(entry, *, title=None, artist=None, duration=None, qu
             score += 25
 
     if source in {"spotify", "deezer"}:
-        if artist_total and artist_matches == 0:
-            score -= 120
-        elif artist_total and artist_matches < max(1, artist_total // 2):
-            score -= 50
-        if artist_total_in_artist and artist_matches_in_artist == 0:
-            score -= 90
-        elif artist_total_in_artist and artist_matches_in_artist < max(1, artist_total_in_artist // 2):
-            score -= 35
+        if title_duration_anchor:
+            # A user upload can omit the artist while still being an exact
+            # audio match. Keep it competitive instead of scoring its
+            # uploader as a conflicting artist.
+            score += 90
+        else:
+            if artist_total and artist_matches == 0:
+                score -= 120
+            elif artist_total and artist_matches < max(1, artist_total // 2):
+                score -= 50
+            if artist_total_in_artist and artist_matches_in_artist == 0:
+                score -= 90
+            elif artist_total_in_artist and artist_matches_in_artist < max(1, artist_total_in_artist // 2):
+                score -= 35
         if title_total and title_matches == 0:
             score -= 90
         elif title_total and title_matches < max(1, title_total // 2):
@@ -303,10 +638,11 @@ def score_youtube_candidate(entry, *, title=None, artist=None, duration=None, qu
             score -= 80
         if "live" in entry_title_text or "karaoke" in entry_title_text or "cover" in entry_title_text:
             score -= 90
-        if explicit_artist and not is_strong_token_match(artist, explicit_artist):
-            score -= 90
-        if explicit_channel and not has_any_token_match(artist, explicit_channel):
-            score -= 45
+        if not title_duration_anchor:
+            if explicit_artist and not is_strong_token_match(artist, explicit_artist):
+                score -= 90
+            if explicit_channel and not has_any_token_match(artist, explicit_channel):
+                score -= 45
 
     entry_duration = entry.get("duration")
     duration = coerce_duration_seconds(duration)
@@ -404,8 +740,8 @@ def sanitize_spotify_input(value):
 
     markdown_link = re.match(r"^\[(?P<label>.+?)\]\((?P<target>.+?)\)$", raw)
     if markdown_link:
-        target = clean_spotify_text(markdown_link.group("target")).strip("`\"'")
-        label = clean_spotify_text(markdown_link.group("label")).strip("`\"'")
+        target = (clean_spotify_text(markdown_link.group("target")) or "").strip("`\"'")
+        label = (clean_spotify_text(markdown_link.group("label")) or "").strip("`\"'")
         for candidate in (target, label):
             if re.search(r"https?://", candidate, flags=re.I):
                 return candidate
@@ -468,7 +804,20 @@ def spotify_playlist_cache_path(item_id):
     return OUTPUT_DIR / SPOTIFY_PLAYLIST_CACHE_DIRNAME / f"playlist_{item_id}.json"
 
 
-def load_spotify_playlist_cache(item_id):
+def atomic_write_text(path, content):
+    path = Path(path)
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path.write_text(content, encoding="utf-8")
+        temporary_path.replace(path)
+    except Exception:
+        with suppress(OSError):
+            temporary_path.unlink()
+        raise
+
+
+def load_spotify_playlist_cache(item_id, *, minimum_count=None):
     cache_path = spotify_playlist_cache_path(item_id)
     if not cache_path.exists():
         return None
@@ -478,6 +827,8 @@ def load_spotify_playlist_cache(item_id):
         return None
     tracks = payload.get("tracks") if isinstance(payload, dict) else None
     if isinstance(tracks, list) and tracks:
+        if minimum_count is not None and len(tracks) < minimum_count:
+            return None
         return tracks
     return None
 
@@ -485,8 +836,8 @@ def load_spotify_playlist_cache(item_id):
 def save_spotify_playlist_cache(item_id, tracks):
     cache_path = spotify_playlist_cache_path(item_id)
     try:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(
+        atomic_write_text(
+            cache_path,
             json.dumps(
                 {
                     "tracks": tracks,
@@ -496,7 +847,6 @@ def save_spotify_playlist_cache(item_id, tracks):
                 ensure_ascii=False,
                 indent=2,
             ),
-            encoding="utf-8",
         )
     except Exception:
         pass
@@ -660,7 +1010,7 @@ def fetch_spotify_web_access_token():
 
         raise RuntimeError(
             f"Spotify web-token HTTP {response.status_code} : "
-            f"{clean_spotify_text(response.text)[:160] or 'réponse invalide'}"
+            f"{(clean_spotify_text(response.text) or '')[:160] or 'réponse invalide'}"
         )
 
     return None
@@ -684,8 +1034,7 @@ def load_spotify_graphql_hash_cache():
 def save_spotify_graphql_hash_cache(cache):
     try:
         cache_path = spotify_graphql_hash_cache_path()
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_text(cache_path, json.dumps(cache, ensure_ascii=False, indent=2))
     except Exception:
         pass
 
@@ -988,8 +1337,8 @@ def reject_partial_spotify_playlist(item_id, tracks, *, declared_count=None):
             declared_count = None
 
     if declared_count and len(tracks) < declared_count:
-        cached_tracks = load_spotify_playlist_cache(item_id)
-        if cached_tracks and len(cached_tracks) >= len(tracks):
+        cached_tracks = load_spotify_playlist_cache(item_id, minimum_count=declared_count)
+        if cached_tracks:
             return cached_tracks
 
         raise RuntimeError(
@@ -1235,7 +1584,7 @@ def normalize_spotify_api_item(item):
     if not isinstance(track, dict):
         return None
 
-    track_type = clean_spotify_text(track.get("type")).lower()
+    track_type = (clean_spotify_text(track.get("type")) or "").lower()
     if track_type and track_type != "track":
         return None
 
@@ -1479,6 +1828,9 @@ def fetch_spotify_playlist_tracks_api(playlist_id, access_token):
         if not page.get("next"):
             break
 
+    if total is not None and offset < total:
+        raise RuntimeError(f"Spotify API a renvoyé une playlist partielle ({offset}/{total}).")
+
     return tracks
 
 
@@ -1670,7 +2022,7 @@ def resolve_spotify_tracks(public_url):
                         except Exception as exc:
                             print(f"    API Spotify {token_label} indisponible : {exc}")
 
-                    cached_tracks = load_spotify_playlist_cache(item_id)
+                    cached_tracks = load_spotify_playlist_cache(item_id, minimum_count=declared_count)
                     if cached_tracks:
                         return cached_tracks
 
@@ -1800,7 +2152,7 @@ def find_existing_track(artist, title, existing_index):
 # YOUTUBE RECHERCHE / EXTRACTION
 # ============================================================
 
-def make_ytdlp_search_options():
+def make_ytdlp_search_options(logger=None):
     options = {
         "quiet": True,
         "no_warnings": True,
@@ -1808,20 +2160,30 @@ def make_ytdlp_search_options():
         "extract_flat": True,
         "noplaylist": True,
         "ignoreerrors": True,
+        "geo_bypass": True,
+        "socket_timeout": 30,
+        "retries": 2,
+        "fragment_retries": 2,
         "default_search": "ytsearch",
         "proxy": "",
         "extractor_args": {
             "youtube": {
-                "player_client": ["default", "web_safari", "android_vr", "ios", "mweb"]
+                "player_client": list(YOUTUBE_YTDL_PLAYER_CLIENTS)
             }
         },
     }
+    if YTDLP_JS_RUNTIMES:
+        options["js_runtimes"] = dict(YTDLP_JS_RUNTIMES)
+    if YTDLP_REMOTE_EJS:
+        options["remote_components"] = {"ejs:github"}
     if YTDLP_COOKIES_BROWSER:
         options["cookiesfrombrowser"] = (YTDLP_COOKIES_BROWSER,)
+    if logger is not None:
+        options["logger"] = logger
     return options
 
 
-def make_ytdlp_download_options(outtmpl):
+def make_ytdlp_download_options(outtmpl, logger=None):
     options = {
         "format": "bestaudio[protocol^=http][abr<=256]/bestaudio[protocol^=http]/bestaudio/best",
         "outtmpl": outtmpl,
@@ -1829,10 +2191,14 @@ def make_ytdlp_download_options(outtmpl):
         "quiet": False,
         "no_warnings": False,
         "ignoreerrors": False,
+        "geo_bypass": True,
+        "socket_timeout": 30,
+        "retries": 2,
+        "fragment_retries": 2,
         "proxy": "",
         "extractor_args": {
             "youtube": {
-                "player_client": ["default", "web_safari", "android_vr", "ios", "mweb"]
+                "player_client": list(YOUTUBE_YTDL_PLAYER_CLIENTS)
             }
         },
         "postprocessors": [
@@ -1843,8 +2209,14 @@ def make_ytdlp_download_options(outtmpl):
             }
         ],
     }
+    if YTDLP_JS_RUNTIMES:
+        options["js_runtimes"] = dict(YTDLP_JS_RUNTIMES)
+    if YTDLP_REMOTE_EJS:
+        options["remote_components"] = {"ejs:github"}
     if YTDLP_COOKIES_BROWSER:
         options["cookiesfrombrowser"] = (YTDLP_COOKIES_BROWSER,)
+    if logger is not None:
+        options["logger"] = logger
     return options
 
 
@@ -1852,6 +2224,20 @@ def make_ytdlp_detail_options():
     options = make_ytdlp_search_options()
     options["extract_flat"] = False
     options["default_search"] = "auto"
+    return options
+
+
+def ytdlp_player_client_variants():
+    variants = []
+    for player_clients in (YOUTUBE_YTDL_PLAYER_CLIENTS, *YOUTUBE_YTDL_FALLBACK_CLIENTS):
+        normalized = tuple(player_clients)
+        if normalized and normalized not in variants:
+            variants.append(normalized)
+    return variants
+
+
+def configure_ytdlp_player_clients(options, player_clients):
+    options["extractor_args"] = {"youtube": {"player_client": list(player_clients)}}
     return options
 
 
@@ -1863,35 +2249,50 @@ def extract_info_with_fallbacks(candidate, *, search=None):
     if search is None:
         search = candidate_text.lower().startswith("ytsearch")
 
-    options = make_ytdlp_search_options() if search else make_ytdlp_detail_options()
-    try:
-        with yt_dlp.YoutubeDL(options) as ydl:
-            data = ydl.extract_info(candidate_text, download=False)
-    except Exception:
+    last_error = None
+    for player_clients in ytdlp_player_client_variants():
+        logger = YtdlpLogCollector()
+        options = make_ytdlp_search_options(logger=logger) if search else make_ytdlp_detail_options()
+        options["logger"] = logger
+        configure_ytdlp_player_clients(options, player_clients)
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                data = ydl.extract_info(candidate_text, download=False)
+        except Exception as exc:
+            if logger.authentication_error or is_youtube_auth_error(exc):
+                raise YouTubeAuthenticationRequired(logger.authentication_error or str(exc)) from exc
+            last_error = exc
+            continue
+        if logger.authentication_error:
+            raise YouTubeAuthenticationRequired(logger.authentication_error)
+        if data:
+            return data
+
+    if last_error is not None:
         return None
-    return data
+    return None
 
 
 def youtube_search(query, count):
     expression = f"ytsearch{count}:{query}"
-    for player_clients in (
-        ["default", "web_safari", "android_vr", "ios", "mweb"],
-        ["web_safari"],
-        ["android_vr"],
-        ["ios"],
-        ["mweb"],
-    ):
-        options = make_ytdlp_search_options()
-        options["extractor_args"] = {"youtube": {"player_client": player_clients}}
+    for player_clients in ytdlp_player_client_variants():
+        logger = YtdlpLogCollector()
+        options = make_ytdlp_search_options(logger=logger)
+        configure_ytdlp_player_clients(options, player_clients)
         try:
             with yt_dlp.YoutubeDL(options) as ydl:
                 data = ydl.extract_info(expression, download=False)
+            if logger.authentication_error:
+                raise YouTubeAuthenticationRequired(logger.authentication_error)
             if data:
                 entries = [e for e in (data.get("entries") or []) if e]
                 if entries:
                     return entries
+        except YouTubeAuthenticationRequired:
+            raise
         except Exception as exc:
-            last_error = exc
+            if is_youtube_auth_error(exc):
+                raise YouTubeAuthenticationRequired(str(exc)) from exc
             continue
     return []
 
@@ -1952,13 +2353,8 @@ def enrich_entry(entry):
     }
     url = result["url"]
     if url:
-        options = make_ytdlp_search_options()
-        options["extract_flat"] = False
-        options["skip_download"] = True
-        options["quiet"] = True
         try:
-            with yt_dlp.YoutubeDL(options) as ydl:
-                data = ydl.extract_info(url, download=False)
+            data = extract_info_with_fallbacks(url, search=False)
             if data:
                 result.update({
                     "url": data.get("webpage_url") or result["url"],
@@ -1971,8 +2367,11 @@ def enrich_entry(entry):
                     "description": data.get("description") or result["description"],
                     "duration": data.get("duration") or result["duration"],
                 })
-        except Exception:
-            pass
+        except Exception as exc:
+            if isinstance(exc, YouTubeAuthenticationRequired):
+                raise
+            if is_youtube_auth_error(exc):
+                raise YouTubeAuthenticationRequired(str(exc)) from exc
     return result
 
 
@@ -1983,6 +2382,35 @@ def dedupe_entries(entries):
         if key:
             result[key] = entry
     return list(result.values())
+
+
+def candidate_identity(candidate):
+    """Build a stable key so a failed video is not selected again."""
+    if not isinstance(candidate, dict):
+        return ""
+    candidate_id = str(candidate.get("id") or "").strip()
+    if candidate_id:
+        return f"id:{candidate_id.lower()}"
+
+    url = str(
+        candidate.get("webpage_url")
+        or candidate.get("original_url")
+        or candidate.get("url")
+        or ""
+    ).strip()
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
+    if "youtube.com" in host:
+        video_id = (parsed.query and re.search(r"(?:^|&)v=([^&]+)", parsed.query))
+        if video_id:
+            return f"id:{video_id.group(1).lower()}"
+    if "youtu.be" in host:
+        video_id = parsed.path.strip("/").split("/", 1)[0]
+        if video_id:
+            return f"id:{video_id.lower()}"
+    return f"url:{url.split('#', 1)[0].rstrip('/').lower()}"
 
 
 def pick_ranked(entries, artist, title, duration, query):
@@ -2002,7 +2430,23 @@ def pick_ranked(entries, artist, title, duration, query):
     return scored
 
 
-def resolve_youtube(artist, title, duration):
+def resolve_youtube(artist, title, duration, *, excluded_urls=None):
+    excluded_ids = {
+        str(value).strip().lower()
+        for value in (excluded_urls or set())
+        if str(value).strip()
+    }
+
+    def rank_available(entries, query):
+        ranked = pick_ranked(entries, expected_artist, expected_title, duration, query)
+        if not excluded_ids:
+            return ranked
+        return [
+            (score, candidate)
+            for score, candidate in ranked
+            if candidate_identity(candidate) not in excluded_ids
+        ]
+
     expected_artist = simplify_track_title(artist)
     expected_title = simplify_track_title(title)
     simplified_title = simplify_track_title(expected_title)
@@ -2039,22 +2483,35 @@ def resolve_youtube(artist, title, duration):
     for index, query in enumerate(primary_queries + fallback_queries):
         if not query:
             continue
-        print(f"    Recherche principale : {query}" if index == 0 else f"    Recherche complémentaire : {query}")
+        safe_print(f"    Recherche principale : {query}" if index == 0 else f"    Recherche complémentaire : {query}")
         count = PRIMARY_SEARCH_SIZE if index == 0 else FALLBACK_SEARCH_SIZE
         all_entries.extend(youtube_search(query, count))
-        ranked_now = pick_ranked(dedupe_entries(all_entries), expected_artist, expected_title, duration, query)
+        ranked_now = rank_available(
+            dedupe_entries(all_entries),
+            query,
+        )
         if not ranked_now:
             continue
         top_score = ranked_now[0][0]
         second_score = ranked_now[1][0] if len(ranked_now) > 1 else None
-        print(
+        safe_print(
             f"    Score courant : {top_score}"
             + (f" | suivant : {second_score}" if second_score is not None else "")
         )
-        if permissive_best is None or top_score > permissive_score:
-            permissive_best = ranked_now[0][1]
-            permissive_score = top_score
-        if top_score >= STRICT_FAST_ACCEPT_SCORE and (second_score is None or top_score - second_score >= YOUTUBE_EARLY_ACCEPT_MARGIN):
+        acceptable_score, acceptable_candidate = first_acceptable_ranked(
+            ranked_now,
+            expected_artist,
+            expected_title,
+            duration,
+        )
+        if acceptable_candidate is not None and (
+            permissive_best is None or acceptable_score > permissive_score
+        ):
+            permissive_best = acceptable_candidate
+            permissive_score = acceptable_score
+        if top_score >= STRICT_FAST_ACCEPT_SCORE and (
+            second_score is None or top_score - second_score >= YOUTUBE_EARLY_ACCEPT_MARGIN
+        ) and acceptable_candidate is ranked_now[0][1]:
             return ranked_now[0][1], top_score
         if len(ranked_now) > 1 and top_score == second_score and top_score >= STRICT_FAST_ACCEPT_SCORE:
             a = ranked_now[0][1]
@@ -2071,26 +2528,35 @@ def resolve_youtube(artist, title, duration):
             if at and bt and at == bt and has_any_token_match(aa, ba) and durations_close:
                 return a, top_score
 
-    ranked = pick_ranked(
+    ranked = rank_available(
         dedupe_entries(all_entries),
-        expected_artist,
-        expected_title,
-        duration,
         f"{expected_artist} {expected_title}".strip(),
     )
     if ranked:
         top_score = ranked[0][0]
         second_score = ranked[1][0] if len(ranked) > 1 else None
-        print(
+        safe_print(
             f"    Score final : {top_score}"
             + (f" | suivant : {second_score}" if second_score is not None else "")
         )
-        if permissive_best is None or top_score > permissive_score:
-            permissive_best = ranked[0][1]
-            permissive_score = top_score
-        if top_score >= STRICT_FAST_ACCEPT_SCORE and (second_score is None or top_score - second_score >= YOUTUBE_EARLY_ACCEPT_MARGIN):
+        acceptable_score, acceptable_candidate = first_acceptable_ranked(
+            ranked,
+            expected_artist,
+            expected_title,
+            duration,
+        )
+        if acceptable_candidate is not None and (
+            permissive_best is None or acceptable_score > permissive_score
+        ):
+            permissive_best = acceptable_candidate
+            permissive_score = acceptable_score
+        if top_score >= STRICT_FAST_ACCEPT_SCORE and (
+            second_score is None or top_score - second_score >= YOUTUBE_EARLY_ACCEPT_MARGIN
+        ) and acceptable_candidate is ranked[0][1]:
             return ranked[0][1], top_score
-        if top_score >= YOUTUBE_EARLY_ACCEPT_SCORE and (second_score is None or top_score - second_score >= YOUTUBE_EARLY_ACCEPT_MARGIN):
+        if top_score >= YOUTUBE_EARLY_ACCEPT_SCORE and (
+            second_score is None or top_score - second_score >= YOUTUBE_EARLY_ACCEPT_MARGIN
+        ) and acceptable_candidate is ranked[0][1]:
             return ranked[0][1], top_score
 
     fallback_searches = []
@@ -2110,7 +2576,7 @@ def resolve_youtube(artist, title, duration):
         if not normalized_search or normalized_search in tried_searches:
             continue
         tried_searches.add(normalized_search)
-        print(f"    Recherche complémentaire : {search_text}")
+        safe_print(f"    Recherche complémentaire : {search_text}")
         fallback_entries = resolve_text_query_candidates(
             search_text,
             source="spotify",
@@ -2119,31 +2585,40 @@ def resolve_youtube(artist, title, duration):
         )
         if not fallback_entries:
             continue
-        fallback_ranked = pick_ranked(
+        fallback_ranked = rank_available(
             dedupe_entries(fallback_entries),
-            expected_artist,
-            expected_title,
-            duration,
             search_text,
         )
         if not fallback_ranked:
             continue
         top_score = fallback_ranked[0][0]
         second_score = fallback_ranked[1][0] if len(fallback_ranked) > 1 else None
-        print(
+        safe_print(
             f"    Score courant : {top_score}"
             + (f" | suivant : {second_score}" if second_score is not None else "")
         )
-        if permissive_best is None or top_score > permissive_score:
-            permissive_best = fallback_ranked[0][1]
-            permissive_score = top_score
-        if top_score >= STRICT_FAST_ACCEPT_SCORE and (second_score is None or top_score - second_score >= YOUTUBE_EARLY_ACCEPT_MARGIN):
+        acceptable_score, acceptable_candidate = first_acceptable_ranked(
+            fallback_ranked,
+            expected_artist,
+            expected_title,
+            duration,
+        )
+        if acceptable_candidate is not None and (
+            permissive_best is None or acceptable_score > permissive_score
+        ):
+            permissive_best = acceptable_candidate
+            permissive_score = acceptable_score
+        if top_score >= STRICT_FAST_ACCEPT_SCORE and (
+            second_score is None or top_score - second_score >= YOUTUBE_EARLY_ACCEPT_MARGIN
+        ) and acceptable_candidate is fallback_ranked[0][1]:
             return fallback_ranked[0][1], top_score
-        if top_score >= YOUTUBE_EARLY_ACCEPT_SCORE and (second_score is None or top_score - second_score >= YOUTUBE_EARLY_ACCEPT_MARGIN):
+        if top_score >= YOUTUBE_EARLY_ACCEPT_SCORE and (
+            second_score is None or top_score - second_score >= YOUTUBE_EARLY_ACCEPT_MARGIN
+        ) and acceptable_candidate is fallback_ranked[0][1]:
             return fallback_ranked[0][1], top_score
 
     if permissive_best:
-        print(f"    Fallback bot permissif : score {permissive_score}")
+        safe_print(f"    Fallback bot permissif : score {permissive_score}")
         return permissive_best, permissive_score
 
     return None, None
@@ -2152,10 +2627,11 @@ def resolve_youtube(artist, title, duration):
 # DOWNLOAD
 # ============================================================
 
+
 def download_audio(candidate, artist, title):
     url = candidate.get("url")
     if not url:
-        return False
+        return False, "missing_url"
 
     safe_artist = normalize_filename(artist)
     safe_title = normalize_filename(title)
@@ -2169,38 +2645,231 @@ def download_audio(candidate, artist, title):
             existing_target = candidate_path
             break
     if existing_target:
-        print(f"    SKIP sécurité : {existing_target.name}")
-        return True
+        safe_print(f"    SKIP sécurité : {existing_target.name}")
+        return True, None
 
-    options = make_ytdlp_download_options(outtmpl)
+    last_error = None
+    had_nonzero_exit = False
+    for player_clients in ytdlp_player_client_variants():
+        logger = YtdlpLogCollector()
+        options = make_ytdlp_download_options(outtmpl, logger=logger)
+        configure_ytdlp_player_clients(options, player_clients)
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                result = ydl.download([url])
+            if logger.authentication_error:
+                return False, "youtube_auth_required"
+            if result not in (0, None):
+                had_nonzero_exit = True
+                continue
+        except Exception as exc:
+            if logger.authentication_error or is_youtube_auth_error(exc):
+                return False, "youtube_auth_required"
+            last_error = exc
+            continue
+
+        # Vérification post-téléchargement après chaque profil yt-dlp.
+        for ext in AUDIO_EXTENSIONS:
+            if (OUTPUT_DIR / f"{safe_artist} - {safe_title}{ext}").exists():
+                return True, None
+
+    if last_error is not None:
+        safe_print(f"    Téléchargement échoué : {last_error}")
+        return False, "download_error"
+    if had_nonzero_exit:
+        return False, "yt_dlp_exit"
+    return False, "output_missing"
+
+
+def initialize_worker(output_dir, capture_logs):
+    global OUTPUT_DIR, WORKER_CAPTURE_LOGS
+    OUTPUT_DIR = Path(output_dir)
+    WORKER_CAPTURE_LOGS = capture_logs
+
+
+def process_missing_track(track, index, total):
+    buffer = io.StringIO()
+    artist = track.get("artist") or "Artiste inconnu"
+    title = track.get("title") or "Titre inconnu"
+    duration = track.get("duration")
+
     try:
-        with yt_dlp.YoutubeDL(options) as ydl:
-            result = ydl.download([url])
-        if result not in (0, None):
-            return False
-    except Exception as exc:
-        print(f"    Téléchargement échoué : {exc}")
-        return False
+        stdout_context = redirect_stdout(buffer) if WORKER_CAPTURE_LOGS else nullcontext()
+        stderr_context = redirect_stderr(buffer) if WORKER_CAPTURE_LOGS else nullcontext()
+        with stdout_context, stderr_context:
+            safe_print(style("┌" + "─" * 64 + "┐", ANSI_MAGENTA))
+            safe_print(f"{style('│', ANSI_MAGENTA)} {style(f'[{index}/{total}]', ANSI_BOLD)} {artist} - {title}")
+            if duration:
+                safe_print(f"{style('│', ANSI_MAGENTA)} Durée Spotify : {duration}s")
+            safe_print(style("├" + "─" * 64 + "┤", ANSI_MAGENTA))
 
-    # Vérification post-téléchargement.
-    for ext in (".opus", ".webm", ".m4a", ".mp3"):
-        if (OUTPUT_DIR / f"{safe_artist} - {safe_title}{ext}").exists():
-            return True
-    return False
+            attempted_ids = set()
+            candidate = None
+            score = None
+            candidate_name = None
+            download_error = "no_candidate"
+
+            for attempt in range(1, MAX_DOWNLOAD_CANDIDATE_ATTEMPTS + 1):
+                candidate, score = resolve_youtube(
+                    artist,
+                    title,
+                    duration,
+                    excluded_urls=attempted_ids,
+                )
+                if not candidate:
+                    break
+
+                candidate_id = candidate_identity(candidate)
+                if candidate_id:
+                    attempted_ids.add(candidate_id)
+                candidate_name = candidate.get("title") or candidate.get("track") or "(sans titre)"
+                if attempt == 1:
+                    safe_print(style(f"    [OK] Source : {candidate_name}", ANSI_GREEN))
+                else:
+                    safe_print(style(f"    [RETRY {attempt}] Source suivante : {candidate_name}", ANSI_YELLOW))
+                safe_print(style(f"    [OK] Score  : {score}", ANSI_GREEN))
+
+                download_result = download_audio(candidate, artist, title)
+                if isinstance(download_result, tuple):
+                    download_ok, download_error = download_result
+                else:
+                    download_ok = bool(download_result)
+                    download_error = None
+                if download_ok:
+                    safe_print(style("    [DONE] Fichier écrit.", ANSI_GREEN))
+                    return {
+                        "ok": True,
+                        "artist": artist,
+                        "title": title,
+                        "score": score,
+                        "candidate": candidate_name,
+                        "log": buffer.getvalue(),
+                        "error": None,
+                    }
+
+                if download_error == "youtube_auth_required":
+                    safe_print(style("    [BLOCKED] YouTube exige des cookies authentifiés.", ANSI_RED))
+                    return {
+                        "ok": False,
+                        "artist": artist,
+                        "title": title,
+                        "score": score,
+                        "candidate": candidate_name,
+                        "log": buffer.getvalue(),
+                        "error": download_error,
+                    }
+
+                safe_print(style(f"    [FAIL] Téléchargement invalide ({download_error or 'download_failed'}).", ANSI_RED))
+                if attempt < MAX_DOWNLOAD_CANDIDATE_ATTEMPTS:
+                    safe_print(style("    [RETRY] Recherche d'une autre source...", ANSI_YELLOW))
+                else:
+                    break
+
+            if candidate is None:
+                safe_print(style("    [FAIL] Aucune source suffisamment fiable.", ANSI_RED))
+                download_error = "no_candidate"
+
+            return {
+                "ok": False,
+                "artist": artist,
+                "title": title,
+                "score": score,
+                "candidate": candidate_name,
+                "log": buffer.getvalue(),
+                "error": download_error or "download_failed",
+            }
+    except YouTubeAuthenticationRequired as exc:
+        message = str(exc)
+        if WORKER_CAPTURE_LOGS:
+            buffer.write(style("    [BLOCKED] YouTube exige des cookies authentifiés.", ANSI_RED) + "\n")
+            buffer.write(message + "\n")
+        else:
+            safe_print(style("    [BLOCKED] YouTube exige des cookies authentifiés.", ANSI_RED))
+            safe_print(message)
+        return {
+            "ok": False,
+            "artist": artist,
+            "title": title,
+            "score": None,
+            "candidate": None,
+            "log": buffer.getvalue(),
+            "error": "youtube_auth_required",
+        }
+    except Exception:
+        import traceback
+        error_text = traceback.format_exc()
+        if WORKER_CAPTURE_LOGS:
+            buffer.write(style("    [FAIL] Exception inattendue.", ANSI_RED) + "\n")
+            buffer.write(error_text)
+        else:
+            safe_print(style("    [FAIL] Exception inattendue.", ANSI_RED))
+            safe_print(error_text)
+        return {
+            "ok": False,
+            "artist": artist,
+            "title": title,
+            "score": None,
+            "candidate": None,
+            "log": buffer.getvalue(),
+            "error": "exception",
+        }
 
 # ============================================================
 # MAIN
 # ============================================================
 
+def parse_worker_count(value):
+    try:
+        worker_count = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("doit être un entier entre 1 et 5") from exc
+    if not 1 <= worker_count <= 5:
+        raise argparse.ArgumentTypeError("doit être compris entre 1 et 5")
+    return worker_count
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Télécharge les pistes manquantes d'une playlist Spotify.")
     parser.add_argument("--playlist", default=None, help="URL ou URI Spotify de la playlist")
     parser.add_argument("--output", default=None, help="Dossier de sortie")
+    parser.add_argument(
+        "--workers",
+        type=parse_worker_count,
+        default=None,
+        help="Nombre de pistes traitées en parallèle (1 à 5)",
+    )
     return parser.parse_args(argv)
 
 
+def consume_track_result(result, failed, completed, total, existing):
+    result_error = result.get("error")
+    if result_error == "youtube_auth_required":
+        status = style("[BLOCKED]", ANSI_RED)
+    else:
+        status = style("[OK]", ANSI_GREEN) if result.get("ok") else style("[FAIL]", ANSI_RED)
+    score = result.get("score")
+    candidate = result.get("candidate") or "n/a"
+    score_text = f"score {score}" if score is not None else "no score"
+    summary = f"{status} {format_progress(completed, total)} {result['artist']} - {result['title']} | {score_text} | {candidate}"
+    print(summary)
+
+    log_text = (result.get("log") or "").rstrip()
+    if log_text:
+        print(indent(log_text, "    "))
+        print()
+
+    if result.get("ok"):
+        expected_name = normalize_search_text(f"{result['artist']} - {result['title']}")
+        existing[expected_name] = OUTPUT_DIR / f"{normalize_filename(result['artist'])} - {normalize_filename(result['title'])}.opus"
+        return True, None
+
+    cause = result_error or "download_failed"
+    failed.append(f"{result['artist']} - {result['title']} | cause={cause}")
+    return False, result_error
+
+
 def main(argv=None):
-    global OUTPUT_DIR, PLAYLIST_URL
+    global OUTPUT_DIR, PLAYLIST_URL, WORKER_CAPTURE_LOGS
 
     with suppress(Exception):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -2213,29 +2882,38 @@ def main(argv=None):
     if args.playlist:
         PLAYLIST_URL = args.playlist
     if not PLAYLIST_URL:
-        raise RuntimeError("Aucune playlist Spotify fournie. Utilise --playlist ou SPOTDL_PLAYLIST_URL.")
+        print(
+            style(
+                "ERREUR : aucune playlist Spotify fournie. Utilise --playlist ou SPOTDL_PLAYLIST_URL.",
+                ANSI_RED,
+            )
+        )
+        return 2
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(style(f"ERREUR sortie : impossible de créer {OUTPUT_DIR} : {exc}", ANSI_RED))
+        return 2
 
-    print("=" * 64)
-    print(" SPOTIFY → YOUTUBE → OPUS | RÉSOLVEUR DU BOT")
-    print("=" * 64)
-    print(f"Dossier   : {OUTPUT_DIR}")
-    print(f"Playlist  : {PLAYLIST_URL}")
-    print(f"Cookies   : {YTDLP_COOKIES_BROWSER or 'désactivés'}")
+    print(style("Initialisation du resolver...", ANSI_DIM))
     print()
 
-    existing = build_existing_index()
-    print(f"Fichiers audio existants : {len(existing)}")
+    try:
+        existing = build_existing_index()
+    except OSError as exc:
+        print(style(f"ERREUR sortie : impossible de lire {OUTPUT_DIR} : {exc}", ANSI_RED))
+        return 2
+    print(style(f"Fichiers audio existants : {len(existing)}", ANSI_DIM))
     print()
 
     try:
         tracks = get_spotify_tracks()
     except Exception as exc:
-        print(f"ERREUR Spotify : {exc}")
+        print(style(f"ERREUR Spotify : {exc}", ANSI_RED))
         return 1
 
-    print(f"Pistes Spotify récupérées : {len(tracks)}")
+    print(style(f"Pistes Spotify récupérées : {len(tracks)}", ANSI_DIM))
     print()
 
     missing = []
@@ -2246,7 +2924,6 @@ def main(argv=None):
     for track in tracks:
         artist = track.get("artist") or "Artiste inconnu"
         title = track.get("title") or "Titre inconnu"
-        duration = track.get("duration")
         key = normalize_search_text(f"{artist} - {title}")
 
         if key in seen:
@@ -2265,50 +2942,130 @@ def main(argv=None):
     print(f"Doublons internes ignorés : {duplicate_playlist_tracks}")
     print(f"À résoudre : {len(missing)}")
 
+    failed_path = OUTPUT_DIR / "_FAILED_BOT_RESOLVER.txt"
     if not missing:
+        with suppress(OSError):
+            failed_path.unlink()
         print("\nAucun nouveau morceau à traiter.")
         return 0
 
     failed = []
-    failed_path = OUTPUT_DIR / "_FAILED_BOT_RESOLVER.txt"
+    requested_workers = args.workers if args.workers is not None else DEFAULT_CONCURRENT_TRACKS
+    worker_count = requested_workers
+    worker_count = min(worker_count, len(missing))
+    print_banner(PLAYLIST_URL, OUTPUT_DIR, worker_count, len(missing))
+    print(style(f"Travail en parallèle : {worker_count} processus", ANSI_DIM))
+    if worker_count == 1:
+        print(style("Mode séquentiel : détail de la piste affiché en direct.", ANSI_DIM))
+    print()
 
-    for index, track in enumerate(missing, 1):
-        artist = track.get("artist") or "Artiste inconnu"
-        title = track.get("title") or "Titre inconnu"
-        duration = track.get("duration")
+    start_time = time.time()
+    completed = 0
+    succeeded = 0
+    stopped_for_youtube_auth = False
+    cancelled_futures = 0
+    if worker_count == 1:
+        WORKER_CAPTURE_LOGS = False
+        for index, track in enumerate(missing, 1):
+            completed += 1
+            try:
+                result = process_missing_track(track, index, len(missing))
+            except Exception as exc:
+                failed_track = f"{track.get('artist') or 'Artiste inconnu'} - {track.get('title') or 'Titre inconnu'}"
+                failed.append(f"{failed_track} | cause=worker_exception:{exc}")
+                print(style(f"[FAIL] {format_progress(completed, len(missing))} {failed_track} | worker exception: {exc}", ANSI_RED))
+                continue
 
-        print("\n" + "-" * 64)
-        print(f"[{index}/{len(missing)}] {artist} - {title}")
-        if duration:
-            print(f"    Durée Spotify : {duration}s")
+            was_successful, result_error = consume_track_result(
+                result,
+                failed,
+                completed,
+                len(missing),
+                existing,
+            )
+            if was_successful:
+                succeeded += 1
+            elif result_error == "youtube_auth_required":
+                stopped_for_youtube_auth = True
+                print(
+                    style(
+                        "Arrêt anticipé : YouTube exige une session authentifiée. "
+                        "Configure les cookies puis relance.",
+                        ANSI_RED,
+                    )
+                )
+                break
+    else:
+        with ProcessPoolExecutor(
+            max_workers=worker_count,
+            initializer=initialize_worker,
+            initargs=(str(OUTPUT_DIR), True),
+        ) as executor:
+            future_tracks = {
+                executor.submit(process_missing_track, track, index, len(missing)): track
+                for index, track in enumerate(missing, 1)
+            }
+            for future in as_completed(future_tracks):
+                completed += 1
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    track = future_tracks[future]
+                    failed_track = f"{track.get('artist') or 'Artiste inconnu'} - {track.get('title') or 'Titre inconnu'}"
+                    failed.append(f"{failed_track} | cause=worker_exception:{exc}")
+                    print(style(f"[FAIL] {format_progress(completed, len(missing))} {failed_track} | worker exception: {exc}", ANSI_RED))
+                    print()
+                    continue
 
-        candidate, score = resolve_youtube(artist, title, duration)
-        if not candidate:
-            print("    ❌ Aucune source suffisamment fiable.")
-            failed.append(f"{artist} - {title}")
-            continue
+                was_successful, result_error = consume_track_result(
+                    result,
+                    failed,
+                    completed,
+                    len(missing),
+                    existing,
+                )
+                if was_successful:
+                    succeeded += 1
+                    continue
 
-        print(f"    ✅ Source : {candidate.get('title') or candidate.get('track') or '(sans titre)'}")
-        print(f"    ✅ Score  : {score}")
+                if result_error == "youtube_auth_required":
+                    stopped_for_youtube_auth = True
+                    for pending_future in future_tracks:
+                        if pending_future is not future and pending_future.cancel():
+                            cancelled_futures += 1
+                    print(
+                        style(
+                            "Arrêt anticipé : YouTube exige une session authentifiée. "
+                            "Configure les cookies puis relance.",
+                            ANSI_RED,
+                        )
+                    )
+                    break
 
-        if not download_audio(candidate, artist, title):
-            failed.append(f"{artist} - {title}")
-            continue
-
-        # Ajout immédiat à l'index : un éventuel doublon ultérieur sera ignoré.
-        expected_name = normalize_search_text(f"{artist} - {title}")
-        existing[expected_name] = OUTPUT_DIR / f"{normalize_filename(artist)} - {normalize_filename(title)}.opus"
-
-    print("\n" + "=" * 64)
-    print(" FIN")
-    print("=" * 64)
-    print(f"Traités : {len(missing) - len(failed)} / {len(missing)}")
-    print(f"Échecs  : {len(failed)}")
+    elapsed = time.time() - start_time
+    print(style("┌" + "─" * 66 + "┐", ANSI_CYAN))
+    print(style(f"│ {fit_text('FINAL SUMMARY', 64):<64} │", ANSI_CYAN))
+    print(style("├" + "─" * 66 + "┤", ANSI_CYAN))
+    print(style(f"│ Done     : {succeeded:<52} │", ANSI_CYAN))
+    print(style(f"│ Failed   : {len(failed):<52} │", ANSI_CYAN))
+    if stopped_for_youtube_auth:
+        print(style(f"│ Stopped  : {fit_text(f'YouTube authentication ({cancelled_futures} queued jobs canceled)', 52):<52} │", ANSI_CYAN))
+    print(style(f"│ Elapsed  : {fit_text(f'{elapsed:.1f}s', 52):<52} │", ANSI_CYAN))
+    print(style("└" + "─" * 66 + "┘", ANSI_CYAN))
 
     if failed:
-        failed_path.write_text("\n".join(failed), encoding="utf-8")
-        print(f"Rapport : {failed_path}")
-        return 2
+        report_entries = list(failed)
+        if stopped_for_youtube_auth:
+            report_entries.append(
+                "ARRÊT : YouTube a demandé une session authentifiée. "
+                "Configure BOT_YTDLP_COOKIES_BROWSER puis relance."
+            )
+        try:
+            atomic_write_text(failed_path, "\n".join(report_entries))
+            print(f"Rapport : {failed_path}")
+        except OSError as exc:
+            print(style(f"Impossible d'écrire le rapport d'échec : {exc}", ANSI_RED))
+        return 3 if stopped_for_youtube_auth else 2
 
     if failed_path.exists():
         try:

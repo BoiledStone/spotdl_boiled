@@ -9,9 +9,11 @@ __pycache__/
 
 # Downloads and cache
 downloads/
+downloads2/
 .spotify_cache/
 _tmp*
 _FAILED*.txt
+*.tmp
 *.opus
 *.mp3
 *.m4a
@@ -26,3 +28,5 @@ _FAILED*.txt
 Thumbs.db
 .vscode/
 .ref_spogo/
+.ruff_cache/
+.pytest_cache/
