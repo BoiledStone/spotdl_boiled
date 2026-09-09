@@ -8,7 +8,7 @@ Prérequis :
 
 - Python 3.10 ou plus récent
 - FFmpeg accessible depuis le `PATH`
-- Firefox connecté a youtube pour fournir des cookies navigateur à yt-dlp
+- Firefox connecté à YouTube pour fournir des cookies navigateur à yt-dlp
 - Deno ou Node recommandé pour l’extraction YouTube récente de yt-dlp; Deno est détecté automatiquement
 
 `requirements.txt` installe aussi `yt-dlp-ejs`, utilisé avec le runtime JavaScript pour les signatures YouTube récentes.
