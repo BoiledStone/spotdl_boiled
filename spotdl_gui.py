@@ -15,6 +15,9 @@ from tkinter import filedialog, messagebox, ttk
 PROJECT_DIR = Path(__file__).resolve().parent
 RESOLVER_SCRIPT = PROJECT_DIR / "download_missing_autonomous_v2.py"
 DOTENV_PATH = Path(os.getenv("BOT_ENV_FILE") or PROJECT_DIR / ".env")
+DEFAULT_PLAYLIST_URL = (
+    "https://open.spotify.com/playlist/0rFIvkUL9MgfkyVU50zC42?si=baced5e4fa6d4e57"
+)
 
 
 def build_resolver_command(python_executable, script_path, playlist, output, workers):
@@ -56,7 +59,10 @@ class ResolverApp:
         self.root.minsize(660, 460)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
-        self.playlist = tk.StringVar(value=os.getenv("SPOTDL_PLAYLIST_URL") or read_dotenv_value("SPOTDL_PLAYLIST_URL"))
+        configured_playlist = os.getenv("SPOTDL_PLAYLIST_URL") or read_dotenv_value(
+            "SPOTDL_PLAYLIST_URL"
+        )
+        self.playlist = tk.StringVar(value=configured_playlist or DEFAULT_PLAYLIST_URL)
         configured_output = os.getenv("SPOTDL_OUTPUT_DIR") or read_dotenv_value("SPOTDL_OUTPUT_DIR")
         self.output = tk.StringVar(value=configured_output or str(PROJECT_DIR / "downloads"))
         self.workers = tk.IntVar(value=self._configured_workers())

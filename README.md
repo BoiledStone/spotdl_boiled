@@ -18,7 +18,7 @@ Depuis PowerShell, dans le dossier du projet :
 ```powershell
 python -m pip install -r .\requirements.txt
 Copy-Item .env.example .env
-.\download_playlist.ps1 -Playlist "https://open.spotify.com/playlist/0rFIvkUL9MgfkyVU50zC42?si=f372b182b612473c"
+.\download_playlist.ps1 -Playlist "https://open.spotify.com/playlist/0rFIvkUL9MgfkyVU50zC42?si=baced5e4fa6d4e57"
 ```
 
 Le dossier `downloads` est créé automatiquement. Pour une première vérification sans playlist configurée, utilise :
@@ -46,7 +46,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 Le fichier `.env` est optionnel. Il permet d’éviter de répéter les paramètres entre deux exécutions :
 
 ```dotenv
-SPOTDL_PLAYLIST_URL=https://open.spotify.com/playlist/...
+SPOTDL_PLAYLIST_URL=https://open.spotify.com/playlist/0rFIvkUL9MgfkyVU50zC42?si=baced5e4fa6d4e57
 SPOTDL_OUTPUT_DIR=.\downloads
 SPOTDL_WORKERS=2
 SPOTDL_MAX_CANDIDATE_ATTEMPTS=6
@@ -60,7 +60,7 @@ Variables disponibles :
 
 | Variable | Rôle | Défaut |
 | --- | --- | --- |
-| `SPOTDL_PLAYLIST_URL` | URL, URI ou identifiant de playlist Spotify | aucun |
+| `SPOTDL_PLAYLIST_URL` | URL, URI ou identifiant de playlist Spotify | playlist par défaut du projet |
 | `SPOTDL_OUTPUT_DIR` | dossier de sortie | `downloads` |
 | `SPOTDL_WORKERS` | pistes traitées en parallèle, de 1 à 5 | `2` |
 | `SPOTDL_MAX_CANDIDATE_ATTEMPTS` | candidats YouTube essayés après un téléchargement invalide, de 1 à 8 | `6` |
@@ -80,6 +80,16 @@ Variables disponibles :
 
 Ne partage jamais `.env` : il peut contenir des cookies ou des identifiants.
 Les valeurs numériques non valides sont remplacées par leurs valeurs par défaut; les valeurs hors limites sont normalisées.
+
+### Changer la playlist par défaut
+
+La playlist par défaut actuelle est [cette playlist Spotify](https://open.spotify.com/playlist/0rFIvkUL9MgfkyVU50zC42?si=baced5e4fa6d4e57). Pour la remplacer durablement, modifie `SPOTDL_PLAYLIST_URL` dans `.env` :
+
+```dotenv
+SPOTDL_PLAYLIST_URL=https://open.spotify.com/playlist/ton-identifiant
+```
+
+Une playlist indiquée avec `--playlist`, `-Playlist` dans PowerShell ou dans le champ de l’interface Windows remplace la valeur par défaut pour cette exécution seulement.
 
 ## Utilisation
 

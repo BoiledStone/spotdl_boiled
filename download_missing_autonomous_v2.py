@@ -36,7 +36,9 @@ if ENV_FILE.exists():
 
 
 DEFAULT_OUTPUT_DIR = Path(os.getenv("SPOTDL_OUTPUT_DIR") or (PROJECT_DIR / "downloads"))
-DEFAULT_PLAYLIST_URL = os.getenv("SPOTDL_PLAYLIST_URL") or ""
+DEFAULT_PLAYLIST_URL = os.getenv("SPOTDL_PLAYLIST_URL") or (
+    "https://open.spotify.com/playlist/0rFIvkUL9MgfkyVU50zC42?si=baced5e4fa6d4e57"
+)
 
 
 def default_ytdlp_cookies_browser():
