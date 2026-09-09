@@ -27,6 +27,12 @@ Le dossier `downloads` est créé automatiquement. Pour une première vérificat
 python .\download_missing_autonomous_v2.py --help
 ```
 
+Pour exécuter les tests locaux, sans appel réseau ni modification des téléchargements :
+
+```powershell
+python -m unittest -v .\test_resolver.py
+```
+
 Si PowerShell bloque les scripts dans la session courante :
 
 ```powershell
@@ -149,5 +155,6 @@ Extensions audio reconnues : `.opus`, `.mp3`, `.m4a`, `.flac`, `.wav`, `.ogg`, `
 - `download_playlist.ps1` : lanceur PowerShell recommandé
 - `.env.example` : modèle de configuration
 - `requirements.txt` : dépendances Python
+- `test_resolver.py` : tests rapides du parsing, du matching et des noms de fichiers
 
 Les téléchargements, caches et fichiers d’échec sont ignorés par Git. Respecte les conditions d’utilisation des services appelés et les droits applicables aux contenus téléchargés.

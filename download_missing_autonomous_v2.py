@@ -30,11 +30,13 @@ from dotenv import load_dotenv
 
 PROJECT_DIR = Path(__file__).resolve().parent
 ENV_FILE = Path(os.getenv("BOT_ENV_FILE") or (PROJECT_DIR / ".env"))
-DEFAULT_OUTPUT_DIR = Path(os.getenv("SPOTDL_OUTPUT_DIR") or (PROJECT_DIR / "downloads"))
-DEFAULT_PLAYLIST_URL = os.getenv("SPOTDL_PLAYLIST_URL") or ""
 
 if ENV_FILE.exists():
     load_dotenv(ENV_FILE)
+
+
+DEFAULT_OUTPUT_DIR = Path(os.getenv("SPOTDL_OUTPUT_DIR") or (PROJECT_DIR / "downloads"))
+DEFAULT_PLAYLIST_URL = os.getenv("SPOTDL_PLAYLIST_URL") or ""
 
 
 def default_ytdlp_cookies_browser():

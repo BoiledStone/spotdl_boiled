@@ -28,6 +28,12 @@ if (-not $PythonCommand) {
     exit 2
 }
 
+$FfmpegCommand = Get-Command ffmpeg -ErrorAction SilentlyContinue
+if (-not $FfmpegCommand) {
+    Write-Host "FFmpeg introuvable dans le PATH. Installe FFmpeg avant de lancer le resolver." -ForegroundColor Red
+    exit 2
+}
+
 if ($PSBoundParameters.ContainsKey("Workers") -and ($Workers -lt 1 -or $Workers -gt 5)) {
     Write-Host "Workers invalide: utilise une valeur entre 1 et 5." -ForegroundColor Red
     exit 2
