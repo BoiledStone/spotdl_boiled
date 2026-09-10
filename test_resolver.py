@@ -68,6 +68,18 @@ class ResolverParsingTests(unittest.TestCase):
             )
         )
 
+    def test_rejects_unrequested_title_variant_even_with_high_score(self):
+        candidate = {
+            "title": "Mega Man 3 - Top Man Stage METALIZED",
+            "artist": "Capcom Sound Team",
+            "duration": 109,
+        }
+        self.assertFalse(
+            resolver.is_fallback_candidate_acceptable(
+                candidate, 177, "Capcom Sound Team", "Top Man Stage", 109
+            )
+        )
+
     def test_gui_builds_argument_list_without_shell_interpolation(self):
         command = build_resolver_command(
             "python.exe",
@@ -90,15 +102,11 @@ class ResolverParsingTests(unittest.TestCase):
             ],
         )
 
-    def test_thread_pool_switch_targets_pythonw_on_windows(self):
-        with patch.object(resolver.os, "name", "nt"), patch.object(
-            resolver.sys, "executable", r"C:\Python312\pythonw.exe"
-        ):
+    def test_thread_pool_switch_targets_windows(self):
+        with patch.object(resolver.os, "name", "nt"):
             self.assertTrue(resolver.use_thread_pool())
 
-        with patch.object(resolver.os, "name", "nt"), patch.object(
-            resolver.sys, "executable", r"C:\Python312\python.exe"
-        ):
+        with patch.object(resolver.os, "name", "posix"):
             self.assertFalse(resolver.use_thread_pool())
 
     def test_candidate_enrichment_is_cached_during_ranking(self):
@@ -113,12 +121,15 @@ class ResolverParsingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_dir:
             settings_path = Path(temporary_dir) / ".spotdl-settings.json"
             with patch.object(spotdl_config, "LOCAL_SETTINGS_PATH", settings_path):
-                spotdl_config.save_local_settings("spotify:playlist:test", "D:/download", 2)
+                spotdl_config.save_local_settings(
+                    "spotify:playlist:test", "D:/download", 2, theme="light"
+                )
             payload = json.loads(settings_path.read_text(encoding="utf-8"))
         self.assertEqual(payload, {
             "playlist_url": "spotify:playlist:test",
             "output_dir": "D:/download",
             "workers": 2,
+            "theme": "light",
         })
 
 

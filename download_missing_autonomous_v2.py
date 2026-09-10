@@ -298,7 +298,7 @@ def format_progress(completed, total, width=24):
 
 def print_banner(playlist_url, output_dir, worker_count, total_tracks=None):
     print(style("┌" + "─" * 66 + "┐", ANSI_CYAN))
-    print(style(f"│ {fit_text('SPOTIFY -> YOUTUBE -> OPUS | Resolver multi-process', 64):<64} │", ANSI_CYAN))
+    print(style(f"│ {fit_text('SPOTIFY -> YOUTUBE -> OPUS | Resolver local', 64):<64} │", ANSI_CYAN))
     print(style("├" + "─" * 66 + "┤", ANSI_CYAN))
     print(style(f"│ Output   : {fit_text(output_dir, 52):<52} │", ANSI_CYAN))
     print(style(f"│ Playlist : {fit_text(playlist_url, 52):<52} │", ANSI_CYAN))
@@ -385,6 +385,8 @@ def build_candidate_blob(candidate):
 def is_fallback_candidate_acceptable(candidate, score, artist, title, duration):
     if not candidate or score is None:
         return False
+    if has_unexpected_title_variant(candidate, title):
+        return False
     if score >= STRICT_FAST_ACCEPT_SCORE:
         return True
 
@@ -455,7 +457,20 @@ def has_reliable_title_duration_anchor(candidate, artist, title, duration):
     if abs(candidate_duration - duration_seconds) > 10:
         return False
 
-    expected_title = normalize_search_text(title)
+    if has_unexpected_title_variant(candidate, title):
+        return False
+
+    explicit_artist = clean_spotify_text(candidate.get("artist"))
+    return not explicit_artist or has_any_token_match(artist, explicit_artist)
+
+
+def has_unexpected_title_variant(candidate, expected_title):
+    """Reject alternate edits unless the requested Spotify title names that edit."""
+    candidate_title = normalize_search_text(" ".join([
+        candidate.get("title") or "",
+        candidate.get("track") or "",
+    ]))
+    expected_title = normalize_search_text(expected_title)
     quality_terms = (
         "lyrics",
         "lyric video",
@@ -473,12 +488,17 @@ def has_reliable_title_duration_anchor(candidate, artist, title, duration):
         "loop",
         "full album",
         "playlist",
+        "metalized",
+        "8 bit",
+        "orchestral",
+        "piano version",
+        "synthesia",
     )
-    if any(term in candidate_title and term not in expected_title for term in quality_terms):
-        return False
-
-    explicit_artist = clean_spotify_text(candidate.get("artist"))
-    return not explicit_artist or has_any_token_match(artist, explicit_artist)
+    return any(
+        f" {term} " in f" {candidate_title} "
+        and f" {term} " not in f" {expected_title} "
+        for term in quality_terms
+    )
 
 
 def first_acceptable_ranked(ranked, artist, title, duration):
@@ -585,7 +605,7 @@ def score_youtube_candidate(entry, *, title=None, artist=None, duration=None, qu
     bad_terms = [
         "lyrics", "lyric video", "sped up", "slowed", "nightcore", "8d", "live", "cover",
         "karaoke", "instrumental", "fan made", "edit audio", "reverb", "remix", "full album",
-        "playlist", "1 hour", "10 hours",
+        "playlist", "1 hour", "10 hours", "metalized", "8 bit", "orchestral", "synthesia",
     ]
     for term in bad_terms:
         if term in haystack:
@@ -2578,7 +2598,16 @@ def resolve_youtube(artist, title, duration, *, excluded_urls=None):
                 and isinstance(b.get("duration"), (int, float))
                 and abs(int(a["duration"]) - int(b["duration"])) <= 3
             )
-            if at and bt and at == bt and has_any_token_match(aa, ba) and durations_close:
+            if (
+                at
+                and bt
+                and at == bt
+                and has_any_token_match(aa, ba)
+                and durations_close
+                and is_fallback_candidate_acceptable(
+                    a, top_score, expected_artist, expected_title, duration
+                )
+            ):
                 return a, top_score
 
     ranked = rank_available(
@@ -2741,8 +2770,8 @@ def initialize_worker(output_dir, capture_logs):
 
 
 def use_thread_pool():
-    """Avoid Windows spawn failures when the resolver is hosted by pythonw.exe."""
-    return os.name == "nt" and Path(sys.executable).stem.lower() == "pythonw"
+    """Use threads on Windows to avoid fragile multiprocessing spawn failures."""
+    return os.name == "nt"
 
 
 def process_missing_track(track, index, total):
@@ -3058,8 +3087,8 @@ def main(argv=None):
     else:
         thread_pool = parallel_label == "threads"
         if thread_pool:
-            # pythonw.exe has no console and can terminate spawned workers on Windows.
-            # The resolver is I/O-bound, so threads preserve concurrency without spawn.
+            # yt-dlp and network requests are I/O-bound. Threads avoid Windows spawn
+            # crashes for both python.exe and pythonw.exe while preserving concurrency.
             WORKER_CAPTURE_LOGS = False
             executor_factory = ThreadPoolExecutor
             executor_options = {"max_workers": worker_count}

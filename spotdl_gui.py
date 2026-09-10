@@ -16,6 +16,31 @@ from spotdl_config import PROJECT_DIR, load_effective_settings, save_local_setti
 
 RESOLVER_SCRIPT = PROJECT_DIR / "download_missing_autonomous_v2.py"
 
+THEME_COLORS = {
+    "dark": {
+        "background": "#101010",
+        "surface": "#1a1a1a",
+        "field": "#242424",
+        "border": "#3a3a3a",
+        "text": "#f2f2f2",
+        "muted": "#b8b8b8",
+        "accent": "#2f7ed8",
+        "accent_active": "#4b94e6",
+        "selection": "#315f91",
+    },
+    "light": {
+        "background": "#f5f5f5",
+        "surface": "#ffffff",
+        "field": "#ffffff",
+        "border": "#b8b8b8",
+        "text": "#171717",
+        "muted": "#5f6368",
+        "accent": "#1769aa",
+        "accent_active": "#0f568d",
+        "selection": "#b8d8f4",
+    },
+}
+
 
 def build_resolver_command(python_executable, script_path, playlist, output, workers):
     """Build the resolver command without shell interpolation."""
@@ -32,7 +57,7 @@ class ResolverApp:
     def __init__(self, root):
         self.root = root
         self.root.title("SpotDL Resolver")
-        self.root.geometry("760x560")
+        self.root.geometry("780x560")
         self.root.minsize(660, 460)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -44,6 +69,7 @@ class ResolverApp:
         except (TypeError, ValueError):
             configured_workers = 2
         self.workers = tk.IntVar(value=min(5, max(1, configured_workers)))
+        self.theme = settings.get("theme") if settings.get("theme") in THEME_COLORS else "dark"
         self.status = tk.StringVar(value="Prêt")
         self.queue = queue.Queue()
         self.process = None
@@ -54,17 +80,79 @@ class ResolverApp:
 
         self._configure_style()
         self._build_ui()
+        self._apply_theme()
         self.root.after(100, self._drain_queue)
 
     def _configure_style(self):
-        style = ttk.Style(self.root)
+        self.style = ttk.Style(self.root)
         try:
-            style.theme_use("vista")
+            self.style.theme_use("clam")
         except tk.TclError:
             pass
-        style.configure("Title.TLabel", font=("Segoe UI", 16, "bold"))
-        style.configure("Muted.TLabel", foreground="#5f6368")
-        style.configure("Action.TButton", padding=(12, 7))
+        self._apply_theme()
+
+    def _apply_theme(self):
+        colors = THEME_COLORS[self.theme]
+        self.root.configure(background=colors["background"])
+        self.style.configure("TFrame", background=colors["background"])
+        self.style.configure("TLabel", background=colors["background"], foreground=colors["text"])
+        self.style.configure(
+            "Title.TLabel",
+            background=colors["background"],
+            foreground=colors["text"],
+            font=("Segoe UI", 16, "bold"),
+        )
+        self.style.configure(
+            "Muted.TLabel", background=colors["background"], foreground=colors["muted"]
+        )
+        self.style.configure("TEntry", fieldbackground=colors["field"], foreground=colors["text"])
+        self.style.configure("TSpinbox", fieldbackground=colors["field"], foreground=colors["text"])
+        self.style.configure(
+            "TLabelframe",
+            background=colors["background"],
+            bordercolor=colors["border"],
+        )
+        self.style.configure(
+            "TLabelframe.Label", background=colors["background"], foreground=colors["text"]
+        )
+        self.style.configure(
+            "TButton",
+            background=colors["surface"],
+            foreground=colors["text"],
+            bordercolor=colors["border"],
+            padding=(8, 6),
+        )
+        self.style.map(
+            "TButton",
+            background=[("active", colors["field"]), ("disabled", colors["surface"])],
+            foreground=[("disabled", colors["muted"])],
+        )
+        self.style.configure(
+            "Action.TButton",
+            background=colors["accent"],
+            foreground="#ffffff",
+            padding=(12, 7),
+        )
+        self.style.map(
+            "Action.TButton",
+            background=[("active", colors["accent_active"]), ("disabled", colors["surface"])],
+            foreground=[("disabled", colors["muted"])],
+        )
+        self.style.configure("Vertical.TScrollbar", background=colors["surface"], troughcolor=colors["field"])
+
+        if hasattr(self, "log"):
+            self.log.configure(
+                background=colors["field"],
+                foreground=colors["text"],
+                insertbackground=colors["text"],
+                selectbackground=colors["selection"],
+                selectforeground=colors["text"],
+            )
+        if hasattr(self, "theme_button"):
+            self.theme_button.configure(text=self._theme_button_text())
+
+    def _theme_button_text(self):
+        return "Mode jour" if self.theme == "dark" else "Mode sombre"
 
     def _build_ui(self):
         outer = ttk.Frame(self.root, padding=20)
@@ -73,8 +161,12 @@ class ResolverApp:
         outer.rowconfigure(4, weight=1)
 
         ttk.Label(outer, text="SpotDL Resolver", style="Title.TLabel").grid(
-            row=0, column=0, columnspan=3, sticky="w"
+            row=0, column=0, columnspan=2, sticky="w"
         )
+        self.theme_button = ttk.Button(
+            outer, text=self._theme_button_text(), command=self.toggle_theme
+        )
+        self.theme_button.grid(row=0, column=2, sticky="e")
         ttk.Label(
             outer,
             text="Télécharge les pistes manquantes d’une playlist Spotify vers un dossier local.",
@@ -136,6 +228,13 @@ class ResolverApp:
         self.save_button.configure(state=state)
         self.stop_button.configure(state="normal" if running else "disabled")
 
+    def toggle_theme(self):
+        self.theme = "light" if self.theme == "dark" else "dark"
+        self._apply_theme()
+        if self._save_preferences():
+            self.status.set(f"{self._theme_button_text()} enregistré")
+            self._append_log(f"[GUI] Apparence {self.theme} enregistrée localement.\n")
+
     def choose_output(self):
         current_output = self._resolve_output_path(self.output.get())
         selected = filedialog.askdirectory(
@@ -160,21 +259,27 @@ class ResolverApp:
             messagebox.showerror("Dossier inaccessible", str(exc))
 
     def save_settings(self):
+        if self._save_preferences():
+            self.status.set("Préférences enregistrées")
+            self._append_log("[GUI] Playlist, dossier, workers et apparence enregistrés localement.\n")
+
+    def _save_preferences(self):
         try:
             worker_count = int(self.workers.get())
         except (TypeError, ValueError):
             messagebox.showerror("Workers invalides", "Choisis une valeur entre 1 et 5.")
-            return
+            return False
         if not 1 <= worker_count <= 5:
             messagebox.showerror("Workers invalides", "Choisis une valeur entre 1 et 5.")
-            return
+            return False
         try:
-            save_local_settings(self.playlist.get(), self.output.get(), worker_count)
+            save_local_settings(
+                self.playlist.get(), self.output.get(), worker_count, theme=self.theme
+            )
         except OSError as exc:
             messagebox.showerror("Enregistrement impossible", str(exc))
-            return
-        self.status.set("Préférences enregistrées")
-        self._append_log("[GUI] Playlist, dossier et workers enregistrés localement.\n")
+            return False
+        return True
 
     def start(self):
         if self.process is not None and self.process.poll() is None:

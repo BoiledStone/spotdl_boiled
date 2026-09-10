@@ -32,7 +32,7 @@ Pour exécuter les tests locaux, sans appel réseau ni modification des téléch
 python -m unittest -v .\test_resolver.py
 ```
 
-Pour utiliser l’interface Windows, double-clique sur `start_spotdl_gui.cmd` (recommandé) ou `spotdl_gui.pyw`. Elle permet de choisir la playlist, le dossier de sortie et le nombre de workers, puis affiche le journal du resolver en direct. Python doit être installé avec Tkinter, ce qui est inclus dans l’installation Windows standard de Python. Le lanceur `.cmd` utilise `pythonw.exe` trouvé dans le `PATH` et évite le launcher `py` s’il est mal configuré.
+Pour utiliser l’interface Windows, double-clique sur `start_spotdl_gui.cmd` (recommandé) ou `spotdl_gui.pyw`. Elle permet de choisir la playlist, le dossier de sortie et le nombre de workers, puis affiche le journal du resolver en direct. Elle démarre en mode sombre; le bouton `Mode jour` bascule l’apparence et mémorise le choix localement. Python doit être installé avec Tkinter, ce qui est inclus dans l’installation Windows standard de Python. Le lanceur `.cmd` utilise `pythonw.exe` trouvé dans le `PATH` et évite le launcher `py` s’il est mal configuré.
 
 Si PowerShell bloque les scripts dans la session courante :
 
@@ -81,7 +81,8 @@ La playlist par défaut actuelle est [cette playlist Spotify](https://open.spoti
 {
   "playlist_url": "https://open.spotify.com/playlist/ton-identifiant",
   "output_dir": ".\\downloads",
-  "workers": 2
+  "workers": 2,
+  "theme": "dark"
 }
 ```
 
@@ -95,7 +96,8 @@ Le dossier public par défaut du projet est `.\downloads`. Pour utiliser un autr
 {
   "playlist_url": "https://open.spotify.com/playlist/ton-identifiant",
   "output_dir": "D:/download",
-  "workers": 2
+  "workers": 2,
+  "theme": "dark"
 }
 ```
 
@@ -114,7 +116,7 @@ Le lanceur vérifie Python, affiche les paramètres actifs et relaie le code ret
   -Workers 2
 ```
 
-`-Workers` accepte une valeur de `1` à `5`. Avec `-Workers 1`, le traitement est réellement séquentiel: aucun worker enfant n’est créé et le détail de la recherche reste visible en direct. En mode console, les workers parallèles utilisent des processus; l’interface Windows utilise automatiquement des threads avec `pythonw.exe` pour éviter les erreurs de démarrage du multiprocessing Windows. Une valeur explicite hors de cette plage est refusée avec le code `2`.
+`-Workers` accepte une valeur de `1` à `5`. Avec `-Workers 1`, le traitement est réellement séquentiel: aucun worker enfant n’est créé et le détail de la recherche reste visible en direct. Sous Windows, les workers parallèles utilisent automatiquement des threads, y compris depuis PowerShell, afin d’éviter les erreurs de démarrage du multiprocessing. Une valeur explicite hors de cette plage est refusée avec le code `2`.
 
 ### Exécution directe
 
@@ -134,7 +136,7 @@ Relance simplement la même commande. Les fichiers audio existants et les doublo
 ## Fonctionnement
 
 - Spotify est lu par plusieurs chemins de secours, avec détection des réponses partielles; un cache de secours n’est utilisé que s’il couvre le nombre de pistes annoncé.
-- Les candidats YouTube sont classés selon le titre, l’artiste, la durée et les signaux de qualité.
+- Les candidats YouTube sont classés selon le titre, l’artiste, la durée et les signaux de qualité; les variantes non demandées (remix, live, metalized, etc.) sont rejetées avant téléchargement.
 - Comme le bot Discord, plusieurs candidats classés sont essayés jusqu’à ce qu’un téléchargement valide soit écrit; le nombre maximal est réglable avec `SPOTDL_MAX_CANDIDATE_ATTEMPTS`.
 - Les titres Unicode, dont le japonais, le coréen et le cyrillique, sont conservés pour l’indexation et le matching.
 - Les téléchargements sont traités en parallèle, sans remplacer un fichier audio déjà présent.
