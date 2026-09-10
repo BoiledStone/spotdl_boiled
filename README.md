@@ -17,7 +17,6 @@ Depuis PowerShell, dans le dossier du projet :
 
 ```powershell
 python -m pip install -r .\requirements.txt
-Copy-Item .env.example .env
 .\download_playlist.ps1 -Playlist "https://open.spotify.com/playlist/0rFIvkUL9MgfkyVU50zC42?si=baced5e4fa6d4e57"
 ```
 
@@ -43,25 +42,18 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 ## Configuration
 
-Le fichier `.env` est optionnel. Il permet d’éviter de répéter les paramètres entre deux exécutions :
+Les valeurs publiques par défaut sont versionnées dans `spotdl.config.json`. Le bouton `Enregistrer` de l’interface Windows écrit les préférences personnelles dans `.spotdl-settings.json`, qui reste local et ignoré par Git.
 
-```dotenv
-SPOTDL_PLAYLIST_URL=https://open.spotify.com/playlist/0rFIvkUL9MgfkyVU50zC42?si=baced5e4fa6d4e57
-SPOTDL_OUTPUT_DIR=.\downloads
-SPOTDL_WORKERS=2
-SPOTDL_MAX_CANDIDATE_ATTEMPTS=6
-# Facultatif: Firefox est détecté automatiquement si un profil local existe.
-# Définis une valeur vide pour désactiver cette détection.
-# BOT_YTDLP_COOKIES_BROWSER=firefox
-# BOT_YTDLP_JS_RUNTIME=deno:C:\path\to\deno.exe
-```
+Le fichier `.env` est facultatif. Il sert uniquement aux surcharges privées, cookies, tokens ou identifiants; `.env.example` documente ces variables sans contenir de valeur secrète.
+
+Ordre de priorité : option de commande ou champ de l’interface, variables `.env`, préférences `.spotdl-settings.json`, puis `spotdl.config.json`.
 
 Variables disponibles :
 
 | Variable | Rôle | Défaut |
 | --- | --- | --- |
-| `SPOTDL_PLAYLIST_URL` | URL, URI ou identifiant de playlist Spotify | playlist par défaut du projet |
-| `SPOTDL_OUTPUT_DIR` | dossier de sortie | `downloads` |
+| `SPOTDL_PLAYLIST_URL` | surcharge privée de l’URL Spotify | `spotdl.config.json` |
+| `SPOTDL_OUTPUT_DIR` | surcharge privée du dossier de sortie | `spotdl.config.json` |
 | `SPOTDL_WORKERS` | pistes traitées en parallèle, de 1 à 5 | `2` |
 | `SPOTDL_MAX_CANDIDATE_ATTEMPTS` | candidats YouTube essayés après un téléchargement invalide, de 1 à 8 | `6` |
 | `SPOTDL_MIN_FALLBACK_SCORE` | score minimal du fallback YouTube | `130` |
@@ -78,34 +70,42 @@ Variables disponibles :
 | `SPOTIFY_TOTP_TIMEOUT_SECONDS` | timeout des appels TOTP | `10` s |
 | `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` | identifiants API Spotify optionnels | aucun |
 
-Ne partage jamais `.env` : il peut contenir des cookies ou des identifiants.
+Ne partage jamais `.env` : il peut contenir des cookies ou des identifiants. Les réglages publics du projet ne nécessitent pas `.env`.
 Les valeurs numériques non valides sont remplacées par leurs valeurs par défaut; les valeurs hors limites sont normalisées.
 
 ### Changer la playlist par défaut
 
-La playlist par défaut actuelle est [cette playlist Spotify](https://open.spotify.com/playlist/0rFIvkUL9MgfkyVU50zC42?si=baced5e4fa6d4e57). Pour la remplacer durablement, modifie `SPOTDL_PLAYLIST_URL` dans `.env` :
+La playlist par défaut actuelle est [cette playlist Spotify](https://open.spotify.com/playlist/0rFIvkUL9MgfkyVU50zC42?si=baced5e4fa6d4e57). Pour la changer localement, modifie le champ Playlist puis clique sur `Enregistrer` dans l’interface Windows. Pour changer le défaut public du dépôt, modifie `playlist_url` dans `spotdl.config.json` :
 
-```dotenv
-SPOTDL_PLAYLIST_URL=https://open.spotify.com/playlist/ton-identifiant
+```json
+{
+  "playlist_url": "https://open.spotify.com/playlist/ton-identifiant",
+  "output_dir": ".\\downloads",
+  "workers": 2
+}
 ```
 
-Une playlist indiquée avec `--playlist`, `-Playlist` dans PowerShell ou dans le champ de l’interface Windows remplace la valeur par défaut pour cette exécution seulement.
+Une playlist indiquée avec `--playlist` ou `-Playlist` remplace la valeur pour cette exécution seulement.
 
 ### Changer le dossier de sortie par défaut
 
-Le dossier par défaut du projet est `.\downloads`. Pour utiliser un autre emplacement durablement, modifie `SPOTDL_OUTPUT_DIR` dans `.env`, par exemple :
+Le dossier public par défaut du projet est `.\downloads`. Pour utiliser un autre emplacement localement, modifie le champ Dossier de sortie puis clique sur `Enregistrer`. Le bouton écrit par exemple :
 
-```dotenv
-SPOTDL_OUTPUT_DIR=D:/download
+```json
+{
+  "playlist_url": "https://open.spotify.com/playlist/ton-identifiant",
+  "output_dir": "D:/download",
+  "workers": 2
+}
 ```
 
-Un chemin absolu comme `D:/download` est recommandé sous Windows. L’option `--output`, `-Output` ou le champ de l’interface Windows remplace ce dossier pour une seule exécution.
+Un chemin absolu comme `D:/download` est recommandé sous Windows. L’option `--output` ou `-Output` remplace ce dossier pour une seule exécution.
 
 ## Utilisation
 
 ### Lanceur PowerShell recommandé
 
-Le lanceur vérifie Python, affiche les paramètres actifs et relaie le code retour du resolver. Les options omises sont lues depuis `.env` par le resolver; une option fournie sur la ligne de commande la remplace.
+Le lanceur vérifie Python, affiche les paramètres actifs et relaie le code retour du resolver. Les options omises utilisent la configuration publique et les préférences locales; une option fournie sur la ligne de commande la remplace.
 
 ```powershell
 .\download_playlist.ps1 `
@@ -178,7 +178,10 @@ Extensions audio reconnues : `.opus`, `.mp3`, `.m4a`, `.flac`, `.wav`, `.ogg`, `
 - `spotdl_gui.pyw` : interface Windows lançable par double-clic
 - `spotdl_gui.py` : logique de l’interface et lancement du resolver
 - `start_spotdl_gui.cmd` : lanceur Windows recommandé
-- `.env.example` : modèle de configuration
+- `spotdl.config.json` : configuration publique versionnée
+- `spotdl_config.py` : chargement et sauvegarde de la configuration
+- `.env.example` : modèle pour surcharges privées et secrets facultatifs
+- `.spotdl-settings.json` : préférences locales créées par l’interface, ignorées par Git
 - `requirements.txt` : dépendances Python
 - `test_resolver.py` : tests rapides du parsing, du matching et des noms de fichiers
 

@@ -6,6 +6,8 @@ __pycache__/
 
 # Environment
 .env
+.spotdl-settings.json
+.*.json.tmp
 
 # Downloads and cache
 downloads/

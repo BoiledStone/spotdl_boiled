@@ -22,23 +22,15 @@ from textwrap import indent
 
 import requests
 import yt_dlp
-from dotenv import load_dotenv
+from spotdl_config import load_effective_settings, resolve_output_dir
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-PROJECT_DIR = Path(__file__).resolve().parent
-ENV_FILE = Path(os.getenv("BOT_ENV_FILE") or (PROJECT_DIR / ".env"))
-
-if ENV_FILE.exists():
-    load_dotenv(ENV_FILE)
-
-
-DEFAULT_OUTPUT_DIR = Path(os.getenv("SPOTDL_OUTPUT_DIR") or (PROJECT_DIR / "downloads"))
-DEFAULT_PLAYLIST_URL = os.getenv("SPOTDL_PLAYLIST_URL") or (
-    "https://open.spotify.com/playlist/0rFIvkUL9MgfkyVU50zC42?si=baced5e4fa6d4e57"
-)
+PROJECT_SETTINGS = load_effective_settings()
+DEFAULT_OUTPUT_DIR = resolve_output_dir(PROJECT_SETTINGS.get("output_dir"))
+DEFAULT_PLAYLIST_URL = PROJECT_SETTINGS.get("playlist_url") or ""
 
 
 def default_ytdlp_cookies_browser():
@@ -58,8 +50,8 @@ def default_ytdlp_cookies_browser():
 
 
 YTDLP_COOKIES_BROWSER = default_ytdlp_cookies_browser()
-OUTPUT_DIR = Path(os.getenv("SPOTDL_OUTPUT_DIR") or DEFAULT_OUTPUT_DIR)
-PLAYLIST_URL = os.getenv("SPOTDL_PLAYLIST_URL") or DEFAULT_PLAYLIST_URL
+OUTPUT_DIR = Path(DEFAULT_OUTPUT_DIR)
+PLAYLIST_URL = DEFAULT_PLAYLIST_URL
 
 PRIMARY_SEARCH_SIZE = 3
 FALLBACK_SEARCH_SIZE = 2
@@ -99,7 +91,9 @@ MIN_FALLBACK_ACCEPT_SCORE = read_int_env("SPOTDL_MIN_FALLBACK_SCORE", 130, minim
 MAX_DOWNLOAD_CANDIDATE_ATTEMPTS = read_int_env(
     "SPOTDL_MAX_CANDIDATE_ATTEMPTS", 6, minimum=1, maximum=8
 )
-DEFAULT_CONCURRENT_TRACKS = read_int_env("SPOTDL_WORKERS", 2, minimum=1, maximum=5)
+DEFAULT_CONCURRENT_TRACKS = read_int_env(
+    "SPOTDL_WORKERS", PROJECT_SETTINGS.get("workers", 2), minimum=1, maximum=5
+)
 
 AUDIO_EXTENSIONS = {".opus", ".mp3", ".m4a", ".flac", ".wav", ".ogg", ".aac", ".webm"}
 MAX_FILENAME_COMPONENT_LENGTH = 120
@@ -2942,7 +2936,7 @@ def main(argv=None):
 
     args = parse_args(argv)
     if args.output:
-        OUTPUT_DIR = Path(args.output)
+        OUTPUT_DIR = resolve_output_dir(args.output)
     if args.playlist:
         PLAYLIST_URL = args.playlist
     if not PLAYLIST_URL:

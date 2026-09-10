@@ -1,8 +1,11 @@
 import importlib.util
+import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import spotdl_config
 from spotdl_gui import build_resolver_command
 
 
@@ -105,6 +108,18 @@ class ResolverParsingTests(unittest.TestCase):
             resolver.pick_ranked([candidate], None, "Track", 180, "Track", enriched_cache=cache)
             resolver.pick_ranked([candidate], None, "Track", 180, "Track", enriched_cache=cache)
         self.assertEqual(enrich.call_count, 1)
+
+    def test_local_settings_save_contains_only_public_preferences(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            settings_path = Path(temporary_dir) / ".spotdl-settings.json"
+            with patch.object(spotdl_config, "LOCAL_SETTINGS_PATH", settings_path):
+                spotdl_config.save_local_settings("spotify:playlist:test", "D:/download", 2)
+            payload = json.loads(settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload, {
+            "playlist_url": "spotify:playlist:test",
+            "output_dir": "D:/download",
+            "workers": 2,
+        })
 
 
 if __name__ == "__main__":

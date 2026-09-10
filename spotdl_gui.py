@@ -8,16 +8,13 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+from spotdl_config import PROJECT_DIR, load_effective_settings, save_local_settings
 
-PROJECT_DIR = Path(__file__).resolve().parent
 RESOLVER_SCRIPT = PROJECT_DIR / "download_missing_autonomous_v2.py"
-DOTENV_PATH = Path(os.getenv("BOT_ENV_FILE") or PROJECT_DIR / ".env")
-DEFAULT_PLAYLIST_URL = (
-    "https://open.spotify.com/playlist/0rFIvkUL9MgfkyVU50zC42?si=baced5e4fa6d4e57"
-)
 
 
 def build_resolver_command(python_executable, script_path, playlist, output, workers):
@@ -31,26 +28,6 @@ def build_resolver_command(python_executable, script_path, playlist, output, wor
     return command
 
 
-def read_dotenv_value(name, path=None):
-    """Read one simple dotenv value without importing or exposing the full file."""
-    dotenv_path = Path(path or DOTENV_PATH)
-    try:
-        lines = dotenv_path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
-        return ""
-
-    prefix = f"{name}="
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or not stripped.startswith(prefix):
-            continue
-        value = stripped[len(prefix):].strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-            value = value[1:-1]
-        return value
-    return ""
-
-
 class ResolverApp:
     def __init__(self, root):
         self.root = root
@@ -59,29 +36,25 @@ class ResolverApp:
         self.root.minsize(660, 460)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
-        configured_playlist = os.getenv("SPOTDL_PLAYLIST_URL") or read_dotenv_value(
-            "SPOTDL_PLAYLIST_URL"
-        )
-        self.playlist = tk.StringVar(value=configured_playlist or DEFAULT_PLAYLIST_URL)
-        configured_output = os.getenv("SPOTDL_OUTPUT_DIR") or read_dotenv_value("SPOTDL_OUTPUT_DIR")
-        self.output = tk.StringVar(value=configured_output or str(PROJECT_DIR / "downloads"))
-        self.workers = tk.IntVar(value=self._configured_workers())
+        settings = load_effective_settings()
+        self.playlist = tk.StringVar(value=settings.get("playlist_url") or "")
+        self.output = tk.StringVar(value=settings.get("output_dir") or ".\\downloads")
+        try:
+            configured_workers = int(settings.get("workers", 2))
+        except (TypeError, ValueError):
+            configured_workers = 2
+        self.workers = tk.IntVar(value=min(5, max(1, configured_workers)))
         self.status = tk.StringVar(value="Prêt")
         self.queue = queue.Queue()
         self.process = None
         self.reader_thread = None
         self.stop_requested = False
+        self.last_output_at = time.monotonic()
+        self.waiting_status_shown = False
 
         self._configure_style()
         self._build_ui()
         self.root.after(100, self._drain_queue)
-
-    def _configured_workers(self):
-        raw = os.getenv("SPOTDL_WORKERS") or read_dotenv_value("SPOTDL_WORKERS")
-        try:
-            return min(5, max(1, int(raw)))
-        except (TypeError, ValueError):
-            return 2
 
     def _configure_style(self):
         style = ttk.Style(self.root)
@@ -141,12 +114,14 @@ class ResolverApp:
         )
         self.open_button = ttk.Button(actions, text="Ouvrir le dossier", command=self.open_output)
         self.open_button.grid(row=0, column=1, padx=(8, 0))
+        self.save_button = ttk.Button(actions, text="Enregistrer", command=self.save_settings)
+        self.save_button.grid(row=0, column=2, padx=(8, 0))
         self.stop_button = ttk.Button(actions, text="Arrêter", command=self.stop, state="disabled")
-        self.stop_button.grid(row=0, column=2, padx=(8, 0))
+        self.stop_button.grid(row=0, column=3, padx=(8, 0))
         self.start_button = ttk.Button(
             actions, text="Démarrer", style="Action.TButton", command=self.start
         )
-        self.start_button.grid(row=0, column=3, padx=(8, 0))
+        self.start_button.grid(row=0, column=4, padx=(8, 0))
 
     def _append_log(self, text):
         self.log.configure(state="normal")
@@ -158,6 +133,7 @@ class ResolverApp:
         state = "disabled" if running else "normal"
         self.start_button.configure(state=state)
         self.browse_button.configure(state=state)
+        self.save_button.configure(state=state)
         self.stop_button.configure(state="normal" if running else "disabled")
 
     def choose_output(self):
@@ -183,6 +159,23 @@ class ResolverApp:
         except OSError as exc:
             messagebox.showerror("Dossier inaccessible", str(exc))
 
+    def save_settings(self):
+        try:
+            worker_count = int(self.workers.get())
+        except (TypeError, ValueError):
+            messagebox.showerror("Workers invalides", "Choisis une valeur entre 1 et 5.")
+            return
+        if not 1 <= worker_count <= 5:
+            messagebox.showerror("Workers invalides", "Choisis une valeur entre 1 et 5.")
+            return
+        try:
+            save_local_settings(self.playlist.get(), self.output.get(), worker_count)
+        except OSError as exc:
+            messagebox.showerror("Enregistrement impossible", str(exc))
+            return
+        self.status.set("Préférences enregistrées")
+        self._append_log("[GUI] Playlist, dossier et workers enregistrés localement.\n")
+
     def start(self):
         if self.process is not None and self.process.poll() is None:
             return
@@ -197,8 +190,8 @@ class ResolverApp:
         if not 1 <= worker_count <= 5:
             messagebox.showerror("Workers invalides", "Choisis une valeur entre 1 et 5.")
             return
-        if not self.playlist.get().strip() and not read_dotenv_value("SPOTDL_PLAYLIST_URL"):
-            messagebox.showwarning("Playlist manquante", "Renseigne une URL Spotify ou configure .env.")
+        if not self.playlist.get().strip():
+            messagebox.showwarning("Playlist manquante", "Renseigne une URL Spotify.")
             return
 
         command = build_resolver_command(
@@ -209,6 +202,8 @@ class ResolverApp:
             worker_count,
         )
         self.stop_requested = False
+        self.last_output_at = time.monotonic()
+        self.waiting_status_shown = False
         self._append_log("\n$ " + subprocess.list2cmdline(command) + "\n\n")
         self.status.set("Exécution en cours…")
         self._set_running(True)
@@ -248,12 +243,36 @@ class ResolverApp:
             while True:
                 event, value = self.queue.get_nowait()
                 if event == "output":
+                    self.last_output_at = time.monotonic()
+                    self.waiting_status_shown = False
+                    self._update_status_from_output(value)
                     self._append_log(value)
                 elif event == "finished":
                     self._process_finished(value)
         except queue.Empty:
             pass
+        if (
+            self.process is not None
+            and self.process.poll() is None
+            and not self.waiting_status_shown
+            and time.monotonic() - self.last_output_at >= 8
+        ):
+            self.status.set("En attente : requête réseau en cours…")
+            self.waiting_status_shown = True
         self.root.after(100, self._drain_queue)
+
+    def _update_status_from_output(self, line):
+        text = line.lower()
+        if "initialisation" in text:
+            self.status.set("Initialisation du resolver…")
+        elif "pathfinder" in text or "pistes spotify" in text:
+            self.status.set("Récupération des pistes Spotify…")
+        elif "recherche" in text:
+            self.status.set("Recherche d’une source audio…")
+        elif "[done]" in text:
+            self.status.set("Piste téléchargée, poursuite du traitement…")
+        elif "final summary" in text:
+            self.status.set("Préparation du résumé…")
 
     def _process_finished(self, code):
         self.process = None
