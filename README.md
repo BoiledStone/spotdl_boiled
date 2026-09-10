@@ -137,6 +137,7 @@ Relance simplement la même commande. Les fichiers audio existants et les doublo
 
 - Spotify est lu par plusieurs chemins de secours, avec détection des réponses partielles; un cache de secours n’est utilisé que s’il couvre le nombre de pistes annoncé.
 - Les candidats YouTube sont classés selon le titre, l’artiste, la durée et les signaux de qualité; les variantes non demandées (remix, live, metalized, etc.) sont rejetées avant téléchargement.
+- Si Spotify ne fournit pas d’artiste, le resolver ne transforme pas le texte d’affichage en critère de recherche; il tente ensuite un fallback basé sur le titre, avec validation de la durée et de l’identité du candidat.
 - Comme le bot Discord, plusieurs candidats classés sont essayés jusqu’à ce qu’un téléchargement valide soit écrit; le nombre maximal est réglable avec `SPOTDL_MAX_CANDIDATE_ATTEMPTS`.
 - Les titres Unicode, dont le japonais, le coréen et le cyrillique, sont conservés pour l’indexation et le matching.
 - Les téléchargements sont traités en parallèle, sans remplacer un fichier audio déjà présent.

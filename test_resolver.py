@@ -80,6 +80,27 @@ class ResolverParsingTests(unittest.TestCase):
             )
         )
 
+    def test_rejects_high_score_when_candidate_title_does_not_match(self):
+        candidate = {
+            "title": "Unrelated upload",
+            "artist": "Artist",
+            "duration": 180,
+            "description": "Artist Track official audio",
+        }
+        self.assertFalse(
+            resolver.is_fallback_candidate_acceptable(
+                candidate, 220, "Artist", "Track", 180
+            )
+        )
+
+    def test_allows_title_duration_anchor_without_youtube_artist_metadata(self):
+        candidate = {"title": "Track", "duration": 180}
+        self.assertTrue(
+            resolver.is_fallback_candidate_acceptable(
+                candidate, 160, "Artist", "Track", 180
+            )
+        )
+
     def test_gui_builds_argument_list_without_shell_interpolation(self):
         command = build_resolver_command(
             "python.exe",
@@ -116,6 +137,17 @@ class ResolverParsingTests(unittest.TestCase):
             resolver.pick_ranked([candidate], None, "Track", 180, "Track", enriched_cache=cache)
             resolver.pick_ranked([candidate], None, "Track", 180, "Track", enriched_cache=cache)
         self.assertEqual(enrich.call_count, 1)
+
+    def test_missing_artist_is_not_used_as_a_search_term(self):
+        candidate = {"id": "video", "url": "https://youtu.be/video", "title": "Track"}
+        with patch.object(resolver, "resolve_youtube", return_value=(candidate, 160)) as resolve:
+            with patch.object(resolver, "download_audio", return_value=(True, None)):
+                result = resolver.process_missing_track(
+                    {"artist": None, "title": "Track", "duration": 180}, 1, 1
+                )
+        self.assertTrue(result["ok"])
+        self.assertEqual(resolve.call_args.args[0], "")
+        self.assertEqual(result["artist"], "Artiste inconnu")
 
     def test_local_settings_save_contains_only_public_preferences(self):
         with tempfile.TemporaryDirectory() as temporary_dir:

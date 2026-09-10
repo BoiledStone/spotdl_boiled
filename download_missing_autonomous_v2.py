@@ -387,7 +387,36 @@ def is_fallback_candidate_acceptable(candidate, score, artist, title, duration):
         return False
     if has_unexpected_title_variant(candidate, title):
         return False
+
+    candidate_title = normalize_search_text(" ".join([
+        candidate.get("title") or "",
+        candidate.get("track") or "",
+    ]))
+    title_match, title_total = token_overlap_score(title, candidate_title)
+    explicit_artist = clean_spotify_text(candidate.get("artist"))
+    if explicit_artist and artist and not has_any_token_match(artist, explicit_artist):
+        return False
+    candidate_identity_text = " ".join([
+        candidate.get("title") or "",
+        candidate.get("track") or "",
+        candidate.get("artist") or "",
+        candidate.get("uploader") or "",
+        candidate.get("channel") or "",
+        candidate.get("album") or "",
+    ])
+    has_artist_signal = not artist or has_any_token_match(artist, candidate_identity_text)
     if score >= STRICT_FAST_ACCEPT_SCORE:
+        # A high score can be inflated by query words found in a description or
+        # uploader name. Keep the fast path tied to the actual candidate title.
+        if title_total and title_match < title_total:
+            return False
+        normalized_title = normalize_search_text(title)
+        if normalized_title and not title_total and normalized_title not in candidate_title:
+            return False
+        if artist and not has_artist_signal and not has_reliable_title_duration_anchor(
+            candidate, artist, title, duration
+        ):
+            return False
         return True
 
     # User-uploaded music often has no artist field. A full title match backed
@@ -447,7 +476,7 @@ def has_reliable_title_duration_anchor(candidate, artist, title, duration):
         candidate.get("track") or "",
     ]))
     title_match, title_total = token_overlap_score(title, candidate_title)
-    if title_total < 2 or title_match < title_total:
+    if title_total < 1 or title_match < title_total:
         return False
 
     candidate_duration = coerce_duration_seconds(candidate.get("duration"))
@@ -2646,6 +2675,8 @@ def resolve_youtube(artist, title, duration, *, excluded_urls=None):
         fallback_searches.extend([
             f"{expected_artist} {expected_title}",
             f"{expected_title} {expected_artist}",
+            f'"{expected_title}" official audio',
+            f'"{expected_title}" audio',
         ])
     if expected_title and not expected_artist:
         fallback_searches.append(expected_title)
@@ -2776,8 +2807,10 @@ def use_thread_pool():
 
 def process_missing_track(track, index, total):
     buffer = io.StringIO()
-    artist = track.get("artist") or "Artiste inconnu"
-    title = track.get("title") or "Titre inconnu"
+    artist = clean_spotify_text(track.get("artist")) or ""
+    title = clean_spotify_text(track.get("title")) or ""
+    display_artist = artist or "Artiste inconnu"
+    display_title = title or "Titre inconnu"
     duration = track.get("duration")
 
     try:
@@ -2785,7 +2818,7 @@ def process_missing_track(track, index, total):
         stderr_context = redirect_stderr(buffer) if WORKER_CAPTURE_LOGS else nullcontext()
         with stdout_context, stderr_context:
             safe_print(style("┌" + "─" * 64 + "┐", ANSI_MAGENTA))
-            safe_print(f"{style('│', ANSI_MAGENTA)} {style(f'[{index}/{total}]', ANSI_BOLD)} {artist} - {title}")
+            safe_print(f"{style('│', ANSI_MAGENTA)} {style(f'[{index}/{total}]', ANSI_BOLD)} {display_artist} - {display_title}")
             if duration:
                 safe_print(f"{style('│', ANSI_MAGENTA)} Durée Spotify : {duration}s")
             safe_print(style("├" + "─" * 64 + "┤", ANSI_MAGENTA))
@@ -2816,7 +2849,7 @@ def process_missing_track(track, index, total):
                     safe_print(style(f"    [RETRY {attempt}] Source suivante : {candidate_name}", ANSI_YELLOW))
                 safe_print(style(f"    [OK] Score  : {score}", ANSI_GREEN))
 
-                download_result = download_audio(candidate, artist, title)
+                download_result = download_audio(candidate, display_artist, display_title)
                 if isinstance(download_result, tuple):
                     download_ok, download_error = download_result
                 else:
@@ -2826,8 +2859,8 @@ def process_missing_track(track, index, total):
                     safe_print(style("    [DONE] Fichier écrit.", ANSI_GREEN))
                     return {
                         "ok": True,
-                        "artist": artist,
-                        "title": title,
+                        "artist": display_artist,
+                        "title": display_title,
                         "score": score,
                         "candidate": candidate_name,
                         "log": buffer.getvalue(),
@@ -2838,8 +2871,8 @@ def process_missing_track(track, index, total):
                     safe_print(style("    [BLOCKED] YouTube exige des cookies authentifiés.", ANSI_RED))
                     return {
                         "ok": False,
-                        "artist": artist,
-                        "title": title,
+                        "artist": display_artist,
+                        "title": display_title,
                         "score": score,
                         "candidate": candidate_name,
                         "log": buffer.getvalue(),
@@ -2858,8 +2891,8 @@ def process_missing_track(track, index, total):
 
             return {
                 "ok": False,
-                "artist": artist,
-                "title": title,
+                "artist": display_artist,
+                "title": display_title,
                 "score": score,
                 "candidate": candidate_name,
                 "log": buffer.getvalue(),
@@ -2875,8 +2908,8 @@ def process_missing_track(track, index, total):
             safe_print(message)
         return {
             "ok": False,
-            "artist": artist,
-            "title": title,
+            "artist": display_artist,
+            "title": display_title,
             "score": None,
             "candidate": None,
             "log": buffer.getvalue(),
@@ -2893,8 +2926,8 @@ def process_missing_track(track, index, total):
             safe_print(error_text)
         return {
             "ok": False,
-            "artist": artist,
-            "title": title,
+            "artist": display_artist,
+            "title": display_title,
             "score": None,
             "candidate": None,
             "log": buffer.getvalue(),
