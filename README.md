@@ -8,8 +8,8 @@ Prérequis :
 
 - Python 3.10 ou plus récent
 - FFmpeg accessible depuis le `PATH`
-- Firefox connecté à YouTube pour fournir des cookies navigateur à yt-dlp
-- Deno ou Node recommandé pour l’extraction YouTube récente de yt-dlp; Deno est détecté automatiquement
+- Firefox avec une session YouTube est recommandé pour fournir des cookies navigateur à yt-dlp, mais reste facultatif
+- Un runtime JavaScript (Deno, Node, QuickJS ou Bun) est recommandé pour l’extraction YouTube récente de yt-dlp; le premier runtime disponible est détecté automatiquement
 
 `requirements.txt` installe aussi `yt-dlp-ejs`, utilisé avec le runtime JavaScript pour les signatures YouTube récentes.
 
@@ -58,15 +58,15 @@ Variables disponibles :
 | `SPOTDL_MAX_CANDIDATE_ATTEMPTS` | candidats YouTube essayés après un téléchargement invalide, de 1 à 8 | `6` |
 | `SPOTDL_MIN_FALLBACK_SCORE` | score minimal du fallback YouTube | `130` |
 | `BOT_YTDLP_COOKIES_BROWSER` | navigateur utilisé pour les cookies yt-dlp | `firefox` si un profil local est détecté, sinon désactivé |
-| `BOT_YTDLP_JS_RUNTIME` | runtime JavaScript yt-dlp forcé, au format `deno:chemin` ou `node:chemin` | Deno puis Node détecté automatiquement |
+| `BOT_YTDLP_JS_RUNTIME` | runtime JavaScript yt-dlp forcé, au format `deno:chemin`, `node:chemin`, `quickjs:chemin` ou `bun:chemin` | Deno, Node, QuickJS puis Bun détecté automatiquement |
 | `BOT_YTDLP_REMOTE_EJS` | autorise le composant EJS distant yt-dlp si le paquet local manque | désactivé si `yt-dlp-ejs` est installé |
 | `BOT_ENV_FILE` | chemin vers un autre fichier `.env` | `.env` |
-| `SPOTDL_PYTHON` | exécutable Python utilisé par PowerShell | `python` |
+| `SPOTDL_PYTHON` | exécutable Python utilisé par le lanceur PowerShell | `python` (variable d’environnement du lanceur) |
 | `SPOTIFY_API_MAX_RETRY_AFTER_SECONDS` | attente maximale après un `429` Spotify | `30` s |
 | `SPOTIFY_PATHFINDER_PAGE_SIZE` | taille des pages Spotify internes | `200` |
 | `SPOTIFY_PATHFINDER_PAGE_DELAY_SECONDS` | pause entre les pages Spotify | `0.2` s |
 | `SPOTIFY_SP_DC` | cookie Spotify `sp_dc`, si nécessaire | aucun |
-| `SPOTIFY_TOTP_SECRETS_URL` | source des secrets TOTP Spotify | source intégrée |
+| `SPOTIFY_TOTP_SECRETS_URL` | source distante optionnelle de la table chiffrée TOTP Spotify | URL intégrée, puis table de secours intégrée |
 | `SPOTIFY_TOTP_TIMEOUT_SECONDS` | timeout des appels TOTP | `10` s |
 | `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` | identifiants API Spotify optionnels | aucun |
 
